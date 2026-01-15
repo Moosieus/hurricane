@@ -6,7 +6,7 @@ A resilient Elixir parser for IDE/LSP tooling. Produces standard Elixir AST and 
 
 Elixir's built-in parser (`Code.string_to_quoted`) fails on the first syntax error—correct for compilation, but unusable for IDE tooling that must handle mid-edit code gracefully.
 
-Existing solutions like [Spitfire](https://github.com/elixir-tools/spitfire) use pure Pratt parsing. Hurricane takes a different approach inspired by [matklad's writings on resilient parsing](https://matklad.github.io/2023/05/21/resilient-ll-parsing.html) (the techniques behind rust-analyzer):
+Existing solutions like [Spitfire](https://github.com/elixir-tools/spitfire) use pure Pratt parsing. Hurricane takes a different approach inspired by [matklad's writings on resilient parsing](https://matklad.github.io/2023/05/21/resilient-ll-parsing-tutorial.html) (the techniques behind rust-analyzer):
 
 - **LL + Pratt hybrid**: Recursive descent for structure (`defmodule`, `case`, `do/end`), Pratt parsing for expressions
 - **Explicit recovery sets**: Every parsing loop knows its synchronization points—when lost, skip to a known-good boundary
