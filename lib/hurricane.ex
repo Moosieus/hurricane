@@ -22,23 +22,12 @@ defmodule Hurricane do
 
   ## Architecture
 
-  Hurricane uses a hybrid LL (recursive descent) + Pratt parsing architecture:
+  Hybrid Pratt + recursive descent parser in `Hurricane.Parser`:
 
-  **Level 1: Structure vs Expression**
-  - `Hurricane.Parser.Structure` uses recursive descent for module-level constructs
-    (defmodule, def, module body)
-  - `Hurricane.Parser.Expression` handles everything inside expression contexts
+  - **Pratt parsing** drives the expression loop (operator precedence, infix/prefix)
+  - **Recursive descent** for complex forms (`case`, `cond`, `fn`, `def`, `defmodule`)
 
-  **Level 2: Within Expression**
-  - **Pratt parsing** for the outer expression loop - handles operator precedence,
-    infix/prefix operators, and combines sub-expressions
-  - **Recursive descent** for complex forms like `case`, `cond`, `fn`, `with`, `try`
-
-  This hybrid approach gives us the best of both worlds: clean LL parsing for
-  structure with clear error recovery, and Pratt parsing for expressions where
-  operator precedence matters.
-
-  See individual module docs for implementation details.
+  See `Hurricane.Parser` moduledoc for details.
   """
 
   alias Hurricane.Parser
