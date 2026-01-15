@@ -19,6 +19,26 @@ defmodule Hurricane do
   - **Compatible**: Output matches `Code.string_to_quoted` for valid input
   - **Predictable**: Uses explicit recovery sets, not ad-hoc heuristics
   - **Debuggable**: Stuck parser = immediate crash with exact location
+
+  ## Architecture
+
+  Hurricane uses a hybrid LL (recursive descent) + Pratt parsing architecture:
+
+  **Level 1: Structure vs Expression**
+  - `Hurricane.Parser.Structure` uses recursive descent for module-level constructs
+    (defmodule, def, module body)
+  - `Hurricane.Parser.Expression` handles everything inside expression contexts
+
+  **Level 2: Within Expression**
+  - **Pratt parsing** for the outer expression loop - handles operator precedence,
+    infix/prefix operators, and combines sub-expressions
+  - **Recursive descent** for complex forms like `case`, `cond`, `fn`, `with`, `try`
+
+  This hybrid approach gives us the best of both worlds: clean LL parsing for
+  structure with clear error recovery, and Pratt parsing for expressions where
+  operator precedence matters.
+
+  See individual module docs for implementation details.
   """
 
   alias Hurricane.Parser

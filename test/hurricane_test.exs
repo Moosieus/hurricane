@@ -264,6 +264,41 @@ world
     end
   end
 
+  describe "compile-time constructs" do
+    test "parses def inside case expression (conditional def)" do
+      # This pattern is used for compile-time conditional function definitions
+      code = """
+      case Mix.env() do
+        :prod -> def hello, do: "prod"
+        :dev -> def hello, do: "dev"
+      end
+      """
+
+      {:ok, our_ast} = Hurricane.parse(code)
+      {:ok, elixir_ast} = Code.string_to_quoted(code, columns: true, token_metadata: true)
+
+      # Strip outer end_of_expression (Elixir adds it to case, we don't)
+      our_ast = strip_metadata(our_ast, [:end_of_expression])
+      elixir_ast = strip_metadata(elixir_ast, [:end_of_expression])
+
+      assert our_ast == elixir_ast
+    end
+
+    test "parses defmodule inside case expression" do
+      code = """
+      case condition do
+        :a -> defmodule Foo, do: nil
+      end
+      """
+
+      {:ok, our_ast} = Hurricane.parse(code)
+      {:ok, elixir_ast} = Code.string_to_quoted(code, columns: true, token_metadata: true)
+      our_ast = strip_metadata(our_ast, [:end_of_expression])
+      elixir_ast = strip_metadata(elixir_ast, [:end_of_expression])
+      assert our_ast == elixir_ast
+    end
+  end
+
   # Helper to strip specific metadata keys from AST
   defp strip_metadata(ast, keys) do
     Macro.postwalk(ast, fn

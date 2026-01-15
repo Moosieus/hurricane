@@ -1,6 +1,40 @@
 defmodule Hurricane.Parser.Expression do
   @moduledoc """
-  Pratt parser for Elixir expressions.
+  Expression parser using both Pratt parsing and recursive descent.
+
+  See `Hurricane` moduledoc for high-level architecture overview.
+
+  ## How It Works
+
+  The core loop: `parse_expression/2` -> `parse_prefix/2` -> `parse_infix_loop/3`
+
+  When `parse_prefix/2` encounters a keyword like `:case`:
+  1. It dispatches to `parse_case/1` (recursive descent)
+  2. `parse_case/1` parses the entire `case ... do ... end` construct
+  3. Returns a complete AST node
+  4. Control returns to `parse_infix_loop/3` which checks for trailing operators
+
+  The Pratt infix loop never looks inside `case` - it just sees the resulting AST.
+  This is why complex forms can appear in expression position: `x = case y do ... end`
+
+  ## What Uses What
+
+  **Pratt parsing (binding power, infix loop):**
+  - Binary operators: `+`, `-`, `*`, `/`, `|>`, `++`, etc.
+  - Comparison: `==`, `!=`, `<`, `>`, etc.
+  - Logical: `and`, `or`, `not`
+  - Assignment: `=`, `<-`
+  - Postfix: function calls `foo()`, access `foo[x]`, dot `foo.bar`
+
+  **Recursive descent (called from parse_prefix):**
+  - Control flow: `case`, `cond`, `if`, `unless`, `with`, `try`, `receive`
+  - Functions: `fn`, `&` capture
+  - Loops: `for` comprehensions
+  - Quoting: `quote`, `unquote`, `unquote_splicing`
+  - Collections: lists `[]`, tuples `{}`, maps `%{}`, binaries `<<>>`
+  - Definition keywords in expression context: `def`, `defmodule` (as macro calls)
+
+  ## Binding Power
 
   Uses binding power to handle operator precedence and associativity.
   Higher binding power = tighter binding.
@@ -2701,18 +2735,24 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_stab_body_exprs(state, acc) do
-    # Stop at clause/block terminators, definition keywords (for recovery), or stab arrow
+    # Stop at clause/block terminators, stab arrow, or orphan delimiters
     # Note: We also stop at :-> because if we hit an arrow, the previous "expression"
     # was actually a pattern for a new stab clause, not part of this body
-    # Also stop at orphan delimiters which indicate parsing went wrong
+    #
+    # Definition keywords (def, defp, etc.) can validly appear in stab bodies
+    # for compile-time conditional definitions like:
+    #   case Mix.env() do
+    #     :prod -> def hello, do: "prod"
+    #   end
+    # So we only treat them as recovery points if on a new line (indicating
+    # they're probably a new top-level item from incomplete code).
     if State.at?(state, :end) or State.at?(state, :else) or
          State.at?(state, :rescue) or State.at?(state, :catch) or
          State.at?(state, :after) or State.at_end?(state) or
          State.at?(state, :->) or
-         State.at?(state, :def) or State.at?(state, :defp) or
-         State.at?(state, :defmacro) or State.at?(state, :defmacrop) or
-         State.at?(state, :defmodule) or
-         State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) do
+         State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) or
+         (State.newline_before?(state) and
+            State.at_any?(state, [:def, :defp, :defmacro, :defmacrop, :defmodule])) do
       {state, acc}
     else
       # Check for new stab clause BEFORE parsing the expression
