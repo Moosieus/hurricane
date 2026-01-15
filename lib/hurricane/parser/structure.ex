@@ -57,6 +57,15 @@ defmodule Hurricane.Parser.Structure do
       State.at?(state, :defmacrop) ->
         parse_def(state, :defmacrop)
 
+      State.at?(state, :defguard) ->
+        parse_def(state, :defguard)
+
+      State.at?(state, :defguardp) ->
+        parse_def(state, :defguardp)
+
+      State.at?(state, :defdelegate) ->
+        parse_defdelegate(state)
+
       State.at?(state, :@) ->
         parse_attribute(state)
 
@@ -157,6 +166,9 @@ defmodule Hurricane.Parser.Structure do
       State.at?(state, :defp) -> parse_def(state, :defp)
       State.at?(state, :defmacro) -> parse_def(state, :defmacro)
       State.at?(state, :defmacrop) -> parse_def(state, :defmacrop)
+      State.at?(state, :defguard) -> parse_def(state, :defguard)
+      State.at?(state, :defguardp) -> parse_def(state, :defguardp)
+      State.at?(state, :defdelegate) -> parse_defdelegate(state)
       State.at?(state, :defmodule) -> parse_defmodule(state)
       State.at?(state, :@) -> parse_attribute(state)
       State.at?(state, :use) -> parse_directive(state, :use)
@@ -213,26 +225,79 @@ defmodule Hurricane.Parser.Structure do
         {state, call_ast}
       end
 
-    # Parse body (do block or comma do:)
-    {state, body, do_token, end_token} =
+    # defguard/defguardp have no body - just the when clause
+    if kind in [:defguard, :defguardp] do
+      ast = {kind, meta, [call_ast]}
+      {state, ast}
+    else
+      # Parse body (do block or comma do:)
       cond do
         State.at?(state, :do) ->
-          parse_do_block(state, &parse_block_body/1)
+          {state, body, do_token, end_token} = parse_do_block(state, &parse_block_body/1)
+          meta = Ast.with_do_end(meta, do_token, end_token)
+          ast = Ast.def_node(kind, call_ast, body, meta)
+          {state, ast}
 
         State.at?(state, :comma) ->
           {state, _comma} = State.advance(state)
-          parse_keyword_do(state)
+          {state, body, do_token, end_token} = parse_keyword_do(state)
+          meta = Ast.with_do_end(meta, do_token, end_token)
+          ast = Ast.def_node(kind, call_ast, body, meta)
+          {state, ast}
 
         true ->
-          # No body - incomplete function
-          state = State.add_error(state, "expected 'do' block or ', do:'")
-          {state, Ast.do_block(nil), nil, nil}
+          # No body - this is a function head (e.g., declaring default args)
+          # Just return {kind, meta, [call_ast]} without body
+          ast = {kind, meta, [call_ast]}
+          {state, ast}
+      end
+    end
+  end
+
+  # defdelegate name(args), to: Module, as: :name
+  defp parse_defdelegate(state) do
+    {state, delegate_token} = State.advance(state)
+    meta = Ast.token_meta(delegate_token)
+
+    # Parse the call (function name with params)
+    {state, call_ast} = Expression.parse_expression(state, 0)
+
+    # Parse comma and keyword options
+    {state, opts} =
+      if State.at?(state, :comma) do
+        {state, _} = State.advance(state)
+        {state, kw_pairs} = parse_keyword_pairs(state)
+        {state, kw_pairs}
+      else
+        {state, []}
       end
 
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    ast = Ast.def_node(kind, call_ast, body, meta)
-
+    ast = {:defdelegate, meta, [call_ast, opts]}
     {state, ast}
+  end
+
+  # Parse keyword pairs (to:, as:)
+  defp parse_keyword_pairs(state) do
+    if State.at?(state, :kw_identifier) do
+      token = State.current(state)
+      {state, _} = State.advance(state)
+      {state, value} = Expression.parse_expression(state, 0)
+
+      case State.eat(state, :comma) do
+        {:ok, state, _} ->
+          if State.at?(state, :kw_identifier) do
+            {state, rest} = parse_keyword_pairs(state)
+            {state, [{token.value, value} | rest]}
+          else
+            {state, [{token.value, value}]}
+          end
+
+        {:error, state} ->
+          {state, [{token.value, value}]}
+      end
+    else
+      {state, []}
+    end
   end
 
   defp parse_function_name(state) do
@@ -409,7 +474,9 @@ defmodule Hurricane.Parser.Structure do
     {state, directive_token} = State.advance(state)
     meta = Ast.token_meta(directive_token)
 
-    {state, alias_ast} = parse_module_alias(state)
+    # Use expression parser to handle both simple aliases (Foo.Bar)
+    # and multi-alias syntax (Foo.{A, B, C})
+    {state, alias_ast} = Expression.parse_expression(state, 0)
 
     # Parse options if present (comma followed by keyword list or expressions)
     {state, args} =

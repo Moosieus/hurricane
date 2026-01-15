@@ -60,4 +60,14 @@ defmodule Hurricane.Lexer do
   defp last_position([{_, {line, column, _}, _} | _]) do
     {line, column}
   end
+
+  # 4-element tokens (heredocs: {:bin_heredoc, pos, indent, content})
+  defp last_position([{_, {line, column, _}, _, _} | _]) do
+    {line, column}
+  end
+
+  # 7-element tokens (sigils: {:sigil, pos, name, content, modifiers, interpolation, delimiter})
+  defp last_position([{_, {line, column, _}, _, _, _, _, _} | _]) do
+    {line, column}
+  end
 end

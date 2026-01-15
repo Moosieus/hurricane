@@ -58,6 +58,7 @@ defmodule Hurricane.Parser.Expression do
 
     # Membership
     :in => {31, 32},
+    :"not in" => {31, 32},
 
     # Bitwise xor
     :"^^^" => {33, 34},
@@ -269,6 +270,10 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :capture_int) ->
         parse_capture_arg(state)
 
+      # Keyword identifier starts implicit keyword list (e.g., `only: [from: 2]`)
+      State.at?(state, :kw_identifier) ->
+        parse_implicit_keyword_list(state)
+
       # Recovery or end of expression
       Recovery.at_recovery?(state, Recovery.expression()) or State.at_end?(state) ->
         {state, nil}
@@ -313,8 +318,14 @@ defmodule Hurricane.Parser.Expression do
 
         _ ->
           # Check for postfix (call, access)
-          {state, lhs} = maybe_parse_postfix(state, lhs, min_bp)
-          {state, lhs}
+          {state, new_lhs} = maybe_parse_postfix(state, lhs, min_bp)
+
+          # If postfix consumed something, continue the loop to check for more infix/postfix
+          if new_lhs != lhs do
+            parse_infix_loop(state, new_lhs, min_bp)
+          else
+            {state, lhs}
+          end
       end
     end
   end
@@ -326,13 +337,22 @@ defmodule Hurricane.Parser.Expression do
     {state, _} = State.advance(state)
     meta = Ast.token_meta(op_token)
 
-    # Special handling for dot operator
-    if op_token.kind == :dot do
-      parse_dot_rhs(state, lhs, meta)
-    else
-      {state, rhs} = parse_expression(state, right_bp)
-      ast = Ast.binary_op(op_token.kind, meta, lhs, rhs)
-      {state, ast}
+    cond do
+      # Special handling for dot operator
+      op_token.kind == :dot ->
+        parse_dot_rhs(state, lhs, meta)
+
+      # Special handling for "not in" - produces {:not, _, [{:in, _, [lhs, rhs]}]}
+      op_token.kind == :"not in" ->
+        {state, rhs} = parse_expression(state, right_bp)
+        in_ast = {:in, meta, [lhs, rhs]}
+        ast = {:not, meta, [in_ast]}
+        {state, ast}
+
+      true ->
+        {state, rhs} = parse_expression(state, right_bp)
+        ast = Ast.binary_op(op_token.kind, meta, lhs, rhs)
+        {state, ast}
     end
   end
 
@@ -368,11 +388,14 @@ defmodule Hurricane.Parser.Expression do
           {state, ast}
         end
 
-      # Tuple access: foo.{a, b}
+      # Multi-alias or tuple access: Foo.{A, B}
       State.at?(state, :lbrace) ->
-        {state, tuple} = parse_tuple(state)
+        {state, _lbrace} = State.advance(state)
+        {state, elements} = parse_collection_elements(state, :rbrace)
+        {state, rbrace} = State.expect(state, :rbrace)
         dot_ast = {:., dot_meta, [lhs, :{}]}
-        ast = {dot_ast, dot_meta, [tuple]}
+        call_meta = if rbrace, do: Ast.with_closing(dot_meta, rbrace), else: dot_meta
+        ast = {dot_ast, call_meta, elements}
         {state, ast}
 
       true ->
@@ -1060,6 +1083,13 @@ defmodule Hurricane.Parser.Expression do
     {state, pairs}
   end
 
+  # Parse implicit keyword list starting with kw_identifier (e.g., `only: [from: 2]`)
+  # This is used when a keyword appears at expression position
+  defp parse_implicit_keyword_list(state) do
+    {state, pairs} = parse_keyword_pairs(state)
+    {state, pairs}
+  end
+
   defp parse_keyword_pairs(state) do
     if State.at?(state, :kw_identifier) do
       token = State.current(state)
@@ -1122,35 +1152,47 @@ defmodule Hurricane.Parser.Expression do
     {state, if_token} = State.advance(state)
     meta = Ast.token_meta(if_token)
 
-    # Parse condition
-    {state, condition} = parse_expression(state, 0)
-
-    # Check for do block or keyword form
-    if State.at?(state, :do) do
-      {state, do_token} = State.advance(state)
-      {state, body} = parse_block_until(state, [:else, :end])
-
-      {state, else_body, end_token} =
-        if State.at?(state, :else) do
-          {state, _} = State.advance(state)
-          {state, else_body} = parse_block_until(state, [:end])
-          {state, end_token} = State.expect(state, :end)
-          {state, else_body, end_token}
-        else
-          {state, end_token} = State.expect(state, :end)
-          {state, nil, end_token}
-        end
-
-      meta = Ast.with_do_end(meta, do_token, end_token)
-      body_kw = if else_body, do: [do: body, else: else_body], else: [do: body]
-      ast = {:if, meta, [condition, body_kw]}
-      {state, ast}
-    else
-      # Keyword form: if cond, do: body, else: else_body
+    # Check for parenthesized form: if(cond, do: x, else: y)
+    if State.at?(state, :lparen) do
+      {state, _} = State.advance(state)
+      {state, condition} = parse_expression(state, 0)
       {state, _} = State.expect(state, :comma)
       {state, kw_pairs} = parse_keyword_pairs(state)
+      {state, closing} = State.expect(state, :rparen)
+      meta = if closing, do: Ast.with_closing(meta, closing), else: meta
       ast = {:if, meta, [condition, kw_pairs]}
       {state, ast}
+    else
+      # Parse condition
+      {state, condition} = parse_expression(state, 0)
+
+      # Check for do block or keyword form
+      if State.at?(state, :do) do
+        {state, do_token} = State.advance(state)
+        {state, body} = parse_block_until(state, [:else, :end])
+
+        {state, else_body, end_token} =
+          if State.at?(state, :else) do
+            {state, _} = State.advance(state)
+            {state, else_body} = parse_block_until(state, [:end])
+            {state, end_token} = State.expect(state, :end)
+            {state, else_body, end_token}
+          else
+            {state, end_token} = State.expect(state, :end)
+            {state, nil, end_token}
+          end
+
+        meta = Ast.with_do_end(meta, do_token, end_token)
+        body_kw = if else_body, do: [do: body, else: else_body], else: [do: body]
+        ast = {:if, meta, [condition, body_kw]}
+        {state, ast}
+      else
+        # Keyword form: if cond, do: body, else: else_body
+        {state, _} = State.expect(state, :comma)
+        {state, kw_pairs} = parse_keyword_pairs(state)
+        ast = {:if, meta, [condition, kw_pairs]}
+        {state, ast}
+      end
     end
   end
 
@@ -1482,8 +1524,114 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp looks_like_new_stab_clause?(state) do
-    # Check if current position looks like start of a new clause
-    peek_for_arrow(state, 0, 20)
+    # A new stab clause typically:
+    # 1. Starts on a new line (has newline before current token)
+    # 2. Has a pattern before the arrow on the same or next line
+    #
+    # The key challenge is distinguishing:
+    #   body_expr           <- end of clause body
+    #   pattern -> expr     <- new clause
+    # from:
+    #   body_expr           <- multi-line expression in body
+    #   continuation        <- still same expression
+    #
+    # The peek_for_arrow_depth function checks that any arrow found
+    # is within 1 line of the start position, which handles this well.
+    case {State.prev(state), State.current(state)} do
+      {%{line: prev_line}, %{line: curr_line}} when curr_line > prev_line ->
+        # Search with reasonable depth - the arrow line check will
+        # prevent false positives from distant arrows
+        peek_for_arrow_simple(state, 0, 30)
+
+      _ ->
+        false
+    end
+  end
+
+  # Look for arrow within a short distance, tracking bracket depth
+  # to allow commas inside tuple patterns like {:ok, x} ->
+  # Also ensure the arrow is on a nearby line (not across a blank line)
+  defp peek_for_arrow_simple(state, depth, max) do
+    current = State.current(state)
+    start_line = if current, do: current.line, else: 0
+    peek_for_arrow_depth(state, depth, max, 0, start_line)
+  end
+
+  defp peek_for_arrow_depth(_state, depth, max, _bracket_depth, _start_line) when depth >= max,
+    do: false
+
+  defp peek_for_arrow_depth(state, depth, max, bracket_depth, start_line) do
+    tokens = state.tokens
+    pos = state.pos + depth
+
+    case Enum.at(tokens, pos) do
+      nil ->
+        false
+
+      # Found arrow at top level (outside any brackets)
+      # Also check it's on the same line or adjacent line (no blank line gap)
+      %{kind: :->, line: arrow_line} when bracket_depth == 0 ->
+        arrow_line - start_line <= 1
+
+      %{kind: :->} ->
+        peek_for_arrow_depth(state, depth + 1, max, bracket_depth, start_line)
+
+      # Terminators - stop searching
+      %{kind: :end} ->
+        false
+
+      %{kind: :else} ->
+        false
+
+      %{kind: :rescue} ->
+        false
+
+      %{kind: :catch} ->
+        false
+
+      %{kind: :after} ->
+        false
+
+      # Track bracket depth
+      %{kind: :lbrace} ->
+        peek_for_arrow_depth(state, depth + 1, max, bracket_depth + 1, start_line)
+
+      %{kind: :rbrace} ->
+        peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
+
+      %{kind: :lbracket} ->
+        peek_for_arrow_depth(state, depth + 1, max, bracket_depth + 1, start_line)
+
+      %{kind: :rbracket} ->
+        peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
+
+      %{kind: :lparen} ->
+        peek_for_arrow_depth(state, depth + 1, max, bracket_depth + 1, start_line)
+
+      %{kind: :rparen} ->
+        peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
+
+      # Comma at top level suggests end of simple expression - stop
+      %{kind: :comma} when bracket_depth == 0 ->
+        false
+
+      # Keywords that have their own stab clauses - stop searching
+      # The -> inside these belongs to their inner clauses, not outer pattern
+      %{kind: :case} ->
+        false
+
+      %{kind: :cond} ->
+        false
+
+      %{kind: :fn} ->
+        false
+
+      %{kind: :receive} ->
+        false
+
+      _ ->
+        peek_for_arrow_depth(state, depth + 1, max, bracket_depth, start_line)
+    end
   end
 
   ## HELPER: PARSE BLOCK UNTIL TERMINATOR
