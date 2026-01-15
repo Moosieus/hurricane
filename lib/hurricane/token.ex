@@ -34,6 +34,17 @@ defmodule Hurricane.Token do
   # Extract normalized kind, value, line, and column from raw token
   defp extract_fields(raw) do
     case raw do
+      # Sigil tokens: {:sigil, pos, sigil_name, content, modifiers, interpolation, delimiter}
+      {:sigil, {line, column, _extra}, sigil_name, content, modifiers, _interpolation, delimiter} ->
+        {:sigil, %{sigil_name: sigil_name, content: content, modifiers: modifiers, delimiter: delimiter}, line, column}
+
+      # Heredoc tokens: {:bin_heredoc, pos, indent, content} or {:list_heredoc, pos, indent, content}
+      {:bin_heredoc, {line, column, _extra}, _indent, content} ->
+        {:heredoc, join_chardata(content), line, column}
+
+      {:list_heredoc, {line, column, _extra}, _indent, content} ->
+        {:charlist_heredoc, content, line, column}
+
       # Two-element tokens (keywords, punctuation)
       {type, {line, column, _extra}} ->
         {normalize_kind(type, nil), nil, line, column}
@@ -42,6 +53,16 @@ defmodule Hurricane.Token do
       {type, {line, column, _extra}, value} ->
         {normalize_kind(type, value), normalize_value(type, value), line, column}
     end
+  end
+
+  # Join chardata list into a single binary
+  defp join_chardata(parts) when is_list(parts) do
+    parts
+    |> Enum.map(fn
+      part when is_binary(part) -> part
+      part when is_list(part) -> IO.chardata_to_string(part)
+    end)
+    |> Enum.join()
   end
 
   # Normalize token types to simpler kinds for the parser

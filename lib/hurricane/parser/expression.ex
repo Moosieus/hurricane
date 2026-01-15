@@ -149,6 +149,9 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :string) ->
         parse_string(state)
 
+      State.at?(state, :heredoc) ->
+        parse_heredoc(state)
+
       State.at?(state, :charlist) ->
         {state, _} = State.advance(state)
         {state, token.value}
@@ -246,9 +249,17 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :map_open) ->
         parse_map(state)
 
+      # Struct (%Foo{})
+      State.at?(state, :percent) ->
+        parse_struct(state)
+
       # Binary/bitstring
       State.at?(state, :langle) ->
         parse_binary(state)
+
+      # Sigil
+      State.at?(state, :sigil) ->
+        parse_sigil(state)
 
       # Anonymous function
       State.at?(state, :fn) ->
@@ -562,6 +573,13 @@ defmodule Hurricane.Parser.Expression do
 
   ## STRINGS
 
+  defp parse_heredoc(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    # Heredocs are simple string values (already joined in lexer)
+    {state, token.value}
+  end
+
   defp parse_string(state) do
     token = State.current(state)
     {state, _} = State.advance(state)
@@ -666,6 +684,54 @@ defmodule Hurricane.Parser.Expression do
     # Add closing metadata
     meta = if rbrace, do: Ast.with_closing(meta, rbrace), else: meta
     ast = Ast.map(pairs, meta)
+    {state, ast}
+  end
+
+  defp parse_sigil(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+
+    # Extract sigil data from token value
+    %{sigil_name: sigil_name, content: content, modifiers: modifiers, delimiter: delimiter} = token.value
+
+    # Build metadata with delimiter
+    meta = [{:delimiter, IO.chardata_to_string([delimiter])} | meta]
+
+    # Build content as binary node
+    content_ast = Ast.binary(content, Ast.token_meta(token))
+
+    # Modifiers as charlist (or empty list)
+    mods = if modifiers == [], do: [], else: modifiers
+
+    ast = {sigil_name, meta, [content_ast, mods]}
+    {state, ast}
+  end
+
+  defp parse_struct(state) do
+    {state, percent_token} = State.advance(state)
+    meta = Ast.token_meta(percent_token)
+
+    # Parse the module alias
+    {state, alias_ast} =
+      if State.at?(state, :alias) do
+        parse_alias(state)
+      else
+        state = State.add_error(state, "expected module name after %")
+        {state, Ast.error(State.current_meta(state))}
+      end
+
+    # Parse the map part - use lbrace position for map metadata
+    {state, lbrace} = State.expect(state, :lbrace)
+    {state, pairs} = parse_map_pairs(state)
+    {state, rbrace} = State.expect(state, :rbrace)
+
+    # Build struct AST: {:%, meta, [alias, {:%{}, map_meta, pairs}]}
+    map_meta = Ast.token_meta(lbrace)
+    map_meta = if rbrace, do: Ast.with_closing(map_meta, rbrace), else: map_meta
+    map_ast = Ast.map(pairs, map_meta)
+    ast = Ast.struct(alias_ast, map_ast, meta)
+
     {state, ast}
   end
 

@@ -70,6 +70,46 @@ defmodule HurricaneTest do
       elixir_ast = strip_metadata(elixir_ast, [:end_of_expression, :newlines])
       assert our_ast == elixir_ast
     end
+
+    test "matches Code.string_to_quoted for struct literals" do
+      codes = [
+        "%Foo{}",
+        "%Foo{bar: 1}",
+        "%Foo.Bar{a: 1, b: 2}"
+      ]
+
+      for code <- codes do
+        {:ok, our_ast} = Hurricane.parse(code)
+        {:ok, elixir_ast} = Code.string_to_quoted(code, columns: true, token_metadata: true)
+        assert our_ast == elixir_ast, "Mismatch for: #{code}"
+      end
+    end
+
+    test "matches Code.string_to_quoted for sigils" do
+      codes = [
+        "~r/test/",
+        "~s(hello)",
+        "~w[one two three]",
+        "~S{raw string}",
+        "~r/test/i"
+      ]
+
+      for code <- codes do
+        {:ok, our_ast} = Hurricane.parse(code)
+        {:ok, elixir_ast} = Code.string_to_quoted(code, columns: true, token_metadata: true)
+        assert our_ast == elixir_ast, "Mismatch for: #{code}"
+      end
+    end
+
+    test "matches Code.string_to_quoted for heredocs" do
+      code = ~S|"""
+hello
+world
+"""|
+      {:ok, our_ast} = Hurricane.parse(code)
+      {:ok, elixir_ast} = Code.string_to_quoted(code, columns: true, token_metadata: true)
+      assert our_ast == elixir_ast
+    end
   end
 
   # Helper to strip specific metadata keys from AST
