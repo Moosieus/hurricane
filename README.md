@@ -1,6 +1,6 @@
 # Hurricane
 
-A resilient Elixir parser for IDE/LSP tooling. Produces standard Elixir AST and always returns a tree, even for broken or incomplete code.
+An experimental resilient Elixir parser for IDE/LSP tooling. Produces standard Elixir AST and always returns a tree, even for broken or incomplete code.
 
 ## Motivation
 
