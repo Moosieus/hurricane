@@ -41,9 +41,7 @@ defmodule Hurricane.Parser.State do
     }
   end
 
-  # ============================================================================
-  # Token Inspection
-  # ============================================================================
+  ## TOKEN INSPECTION
 
   @doc """
   Get the current token without consuming it.
@@ -110,9 +108,7 @@ defmodule Hurricane.Parser.State do
     at?(state, :eof)
   end
 
-  # ============================================================================
-  # Token Consumption
-  # ============================================================================
+  ## TOKEN CONSUMPTION
 
   @doc """
   Consume the current token and advance to the next.
@@ -165,9 +161,7 @@ defmodule Hurricane.Parser.State do
     end
   end
 
-  # ============================================================================
-  # Error Handling
-  # ============================================================================
+  ## ERROR HANDLING
 
   @doc """
   Add an error at the current position.
@@ -201,9 +195,7 @@ defmodule Hurricane.Parser.State do
     Enum.reverse(state.errors)
   end
 
-  # ============================================================================
-  # Advance Assertions
-  # ============================================================================
+  ## ADVANCE ASSERTIONS
 
   @doc """
   Push current position onto checkpoint stack before a loop iteration.
@@ -236,9 +228,7 @@ defmodule Hurricane.Parser.State do
     end
   end
 
-  # ============================================================================
-  # Position Helpers
-  # ============================================================================
+  ## POSITION HELPERS
 
   @doc """
   Get metadata (line/column) for the current position.

@@ -6,9 +6,7 @@ defmodule Hurricane.Ast do
   with `columns: true, token_metadata: true`.
   """
 
-  # ============================================================================
-  # Standard AST Nodes
-  # ============================================================================
+  ## STANDARD AST NODES
 
   @doc """
   Build a function/macro call node.
@@ -107,9 +105,7 @@ defmodule Hurricane.Ast do
     {key, value}
   end
 
-  # ============================================================================
-  # Collections
-  # ============================================================================
+  ## COLLECTIONS
 
   @doc """
   Build a tuple node.
@@ -143,9 +139,7 @@ defmodule Hurricane.Ast do
     {:<<>>, meta, elements}
   end
 
-  # ============================================================================
-  # Special Forms
-  # ============================================================================
+  ## SPECIAL FORMS
 
   @doc """
   Build a stab clause (-> clause in case/cond/fn).
@@ -189,9 +183,7 @@ defmodule Hurricane.Ast do
     {:@, meta, [name_ast]}
   end
 
-  # ============================================================================
-  # Error Nodes
-  # ============================================================================
+  ## ERROR NODES
 
   @doc """
   Build an error node.
@@ -211,9 +203,7 @@ defmodule Hurricane.Ast do
     error(meta)
   end
 
-  # ============================================================================
-  # Metadata Helpers
-  # ============================================================================
+  ## METADATA HELPERS
 
   @doc """
   Build metadata from a token.

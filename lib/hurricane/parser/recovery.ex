@@ -21,9 +21,7 @@ defmodule Hurricane.Parser.Recovery do
 
   alias Hurricane.Parser.State
 
-  # ============================================================================
-  # Recovery Set Definitions
-  # ============================================================================
+  ## RECOVERY SET DEFINITIONS
 
   @doc """
   Recovery set for module body items.
@@ -181,9 +179,7 @@ defmodule Hurricane.Parser.Recovery do
     ]
   end
 
-  # ============================================================================
-  # Recovery Operations
-  # ============================================================================
+  ## RECOVERY OPERATIONS
 
   @doc """
   Check if the current token is in the given recovery set.

@@ -12,9 +12,7 @@ defmodule Hurricane.Parser.Expression do
   alias Hurricane.Ast
   alias Hurricane.Parser.{State, Recovery}
 
-  # ============================================================================
-  # Binding Power Tables
-  # ============================================================================
+  ## BINDING POWER TABLES
 
   # Infix operators: {left_bp, right_bp}
   # Listed from lowest to highest precedence
@@ -112,9 +110,7 @@ defmodule Hurricane.Parser.Expression do
   @call_bp 60
   @access_bp 60
 
-  # ============================================================================
-  # Public API
-  # ============================================================================
+  ## PUBLIC API
 
   @doc """
   Parse an expression with given minimum binding power.
@@ -127,9 +123,7 @@ defmodule Hurricane.Parser.Expression do
     parse_infix_loop(state, lhs, min_bp)
   end
 
-  # ============================================================================
-  # Prefix Parsing
-  # ============================================================================
+  ## PREFIX PARSING
 
   defp parse_prefix(state) do
     token = State.current(state)
@@ -290,9 +284,7 @@ defmodule Hurricane.Parser.Expression do
     {state, ast}
   end
 
-  # ============================================================================
-  # Infix Loop
-  # ============================================================================
+  ## INFIX LOOP
 
   defp parse_infix_loop(state, lhs, min_bp) do
     token = State.current(state)
@@ -333,9 +325,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Dot Access
-  # ============================================================================
+  ## DOT ACCESS
 
   defp parse_dot_rhs(state, lhs, dot_meta) do
     token = State.current(state)
@@ -380,9 +370,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Postfix (Calls and Access)
-  # ============================================================================
+  ## POSTFIX (Calls and Access)
 
   defp maybe_parse_postfix(state, lhs, min_bp) do
     cond do
@@ -476,9 +464,7 @@ defmodule Hurricane.Parser.Expression do
     maybe_parse_postfix(state, ast, @call_bp)
   end
 
-  # ============================================================================
-  # Atoms and Identifiers
-  # ============================================================================
+  ## ATOMS AND IDENTIFIERS
 
   defp parse_identifier_or_call(state) do
     token = State.current(state)
@@ -574,9 +560,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Strings
-  # ============================================================================
+  ## STRINGS
 
   defp parse_string(state) do
     token = State.current(state)
@@ -597,10 +581,12 @@ defmodule Hurricane.Parser.Expression do
           {state, {:<<>>, meta, ast_parts}}
         else
           # Just string parts, join them
-          joined = Enum.map_join(parts, fn
-            str when is_binary(str) -> str
-            _ -> ""
-          end)
+          joined =
+            Enum.map_join(parts, fn
+              str when is_binary(str) -> str
+              _ -> ""
+            end)
+
           {state, joined}
         end
 
@@ -620,12 +606,14 @@ defmodule Hurricane.Parser.Expression do
 
         # Build the interpolation AST structure
         dot_meta = [line: start_line, column: start_col]
+
         call_meta = [
           from_interpolation: true,
           closing: [line: start_line, column: end_col],
           line: start_line,
           column: start_col
         ]
+
         binary_meta = [line: start_line, column: start_col]
         type_meta = [line: start_line, column: start_col]
 
@@ -650,9 +638,7 @@ defmodule Hurricane.Parser.Expression do
     ast
   end
 
-  # ============================================================================
-  # Collections
-  # ============================================================================
+  ## COLLECTIONS
 
   defp parse_list(state) do
     {state, _lbracket} = State.advance(state)
@@ -707,6 +693,7 @@ defmodule Hurricane.Parser.Expression do
           single when not is_nil(single) -> [single | rest]
           nil -> rest
         end
+
       {state, elements}
     end
   end
@@ -726,6 +713,7 @@ defmodule Hurricane.Parser.Expression do
               single when not is_nil(single) -> [single | rest]
               nil -> rest
             end
+
           {state, elements}
         end
 
@@ -793,9 +781,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Capture Arguments (&1, &2, etc.)
-  # ============================================================================
+  ## CAPTURE ARGUMENTS (&1, &2, etc.)
 
   defp parse_capture_arg(state) do
     {state, capture_token} = State.advance(state)
@@ -814,9 +800,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Parenthesized Expression
-  # ============================================================================
+  ## PARENTHESIZED EXPRESSION
 
   defp parse_parenthesized(state) do
     {state, lparen} = State.advance(state)
@@ -839,9 +823,7 @@ defmodule Hurricane.Parser.Expression do
 
   defp add_parens_meta(expr, _lparen, _rparen), do: expr
 
-  # ============================================================================
-  # Anonymous Functions
-  # ============================================================================
+  ## ANONYMOUS FUNCTIONS
 
   defp parse_fn(state) do
     {state, fn_token} = State.advance(state)
@@ -968,9 +950,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Call Arguments
-  # ============================================================================
+  ## CALL ARGUMENTS
 
   defp parse_call_args(state) do
     if State.at?(state, :rparen) do
@@ -1041,9 +1021,7 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # ============================================================================
-  # Special Forms
-  # ============================================================================
+  ## SPECIAL FORMS
 
   # case expr do clauses end
   defp parse_case(state) do
@@ -1341,9 +1319,7 @@ defmodule Hurricane.Parser.Expression do
     {state, ast}
   end
 
-  # ============================================================================
-  # Helper: Parse block with stab clauses
-  # ============================================================================
+  ## HELPER: PARSE BLOCK WITH STAB CLAUSES
 
   defp parse_stab_block(state) do
     {state, do_token} = State.expect(state, :do)
@@ -1444,9 +1420,7 @@ defmodule Hurricane.Parser.Expression do
     peek_for_arrow(state, 0, 20)
   end
 
-  # ============================================================================
-  # Helper: Parse block until terminator
-  # ============================================================================
+  ## HELPER: PARSE BLOCK UNTIL TERMINATOR
 
   defp parse_block_until(state, terminators) do
     {state, exprs} = parse_block_until_exprs(state, terminators, [])

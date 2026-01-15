@@ -31,6 +31,7 @@ defmodule HurricaneTest do
 
       for code <- malformed_codes do
         result = Hurricane.parse(code)
+
         assert match?({:ok, _}, result) or match?({:ok, _, _}, result),
                "Parser crashed on: #{inspect(code)}"
       end

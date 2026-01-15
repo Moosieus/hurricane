@@ -9,9 +9,7 @@ defmodule Hurricane.Parser.Structure do
   alias Hurricane.Ast
   alias Hurricane.Parser.{State, Recovery, Expression}
 
-  # ============================================================================
-  # Top Level
-  # ============================================================================
+  ## TOP LEVEL
 
   @doc """
   Parse the entire source file as a top-level expression or block.
@@ -74,9 +72,7 @@ defmodule Hurricane.Parser.Structure do
     end
   end
 
-  # ============================================================================
-  # Module Definition
-  # ============================================================================
+  ## MODULE DEFINITION
 
   defp parse_defmodule(state) do
     {state, defmodule_token} = State.expect(state, :defmodule)
@@ -129,9 +125,7 @@ defmodule Hurricane.Parser.Structure do
     end
   end
 
-  # ============================================================================
-  # Module Body
-  # ============================================================================
+  ## MODULE BODY
 
   defp parse_module_body(state) do
     {state, items} = parse_module_body_items(state, [])
@@ -175,9 +169,7 @@ defmodule Hurricane.Parser.Structure do
     end
   end
 
-  # ============================================================================
-  # Function Definition
-  # ============================================================================
+  ## FUNCTION DEFINITION
 
   defp parse_def(state, kind) do
     {state, def_token} = State.advance(state)
@@ -260,9 +252,7 @@ defmodule Hurricane.Parser.Structure do
     meta
   end
 
-  # ============================================================================
-  # Parameters
-  # ============================================================================
+  ## PARAMETERS
 
   defp parse_params(state) do
     if State.at?(state, :rparen) or Recovery.at_recovery?(state, Recovery.params()) do
@@ -300,19 +290,13 @@ defmodule Hurricane.Parser.Structure do
     end
   end
 
-  # ============================================================================
-  # Guards
-  # ============================================================================
+  ## GUARDS
 
   defp parse_guard_expression(state) do
-    # TODO: Full expression parsing
-    # For now, parse simple function calls
     Expression.parse_expression(state)
   end
 
-  # ============================================================================
-  # Do Blocks
-  # ============================================================================
+  ## DO BLOCKS
 
   defp parse_do_block(state, body_parser) do
     {state, do_token} = State.expect(state, :do)
@@ -345,9 +329,7 @@ defmodule Hurricane.Parser.Structure do
     end
   end
 
-  # ============================================================================
-  # Block Body
-  # ============================================================================
+  ## BLOCK BODY
 
   defp parse_block_body(state) do
     {state, exprs} = parse_block_body_items(state, [])
@@ -375,13 +357,10 @@ defmodule Hurricane.Parser.Structure do
   end
 
   defp parse_block_body_item(state) do
-    # TODO: Full expression parsing
     Expression.parse_expression(state)
   end
 
-  # ============================================================================
-  # Module Attributes
-  # ============================================================================
+  ## MODULE ATTRIBUTES
 
   defp parse_attribute(state) do
     {state, at_token} = State.expect(state, :@)
@@ -424,9 +403,7 @@ defmodule Hurricane.Parser.Structure do
     {state, ast}
   end
 
-  # ============================================================================
-  # Directives (use, import, alias, require)
-  # ============================================================================
+  ## DIRECTIVES (use, import, alias, require)
 
   defp parse_directive(state, kind) do
     {state, directive_token} = State.advance(state)
