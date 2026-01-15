@@ -28,6 +28,9 @@ defmodule Hurricane.Parser.Structure do
   end
 
   defp parse_top_level_items(state, acc) do
+    # Skip any semicolons (expression separators)
+    state = skip_semicolons(state)
+
     if State.at_end?(state) do
       {state, Enum.reverse(acc)}
     else
@@ -35,8 +38,17 @@ defmodule Hurricane.Parser.Structure do
       {state, expr} = parse_top_level_item(state)
       state = State.advance_pop!(state)
 
-      acc = if expr, do: [expr | acc], else: acc
+      acc = if expr != nil, do: [expr | acc], else: acc
       parse_top_level_items(state, acc)
+    end
+  end
+
+  defp skip_semicolons(state) do
+    if State.at?(state, :semicolon) do
+      {state, _} = State.advance(state)
+      skip_semicolons(state)
+    else
+      state
     end
   end
 
@@ -71,12 +83,32 @@ defmodule Hurricane.Parser.Structure do
       State.at?(state, :defdelegate) and not is_paren_call ->
         parse_defdelegate(state)
 
-      State.at?(state, :@) ->
-        parse_attribute(state)
+      # Note: @ is NOT handled specially here - it goes through Expression.parse_expression
+      # so that @foo + 1 parses as (@foo) + 1 via the infix loop
 
       # Stray :end tokens from incomplete structures - skip with error
       State.at?(state, :end) ->
         state = State.add_error(state, "unexpected end")
+        {state, _} = State.advance(state)
+        {state, nil}
+
+      # Stray :-> tokens from incomplete clauses - skip with error
+      State.at?(state, :->) ->
+        state = State.add_error(state, "unexpected ->")
+        {state, _} = State.advance(state)
+        {state, nil}
+
+      # Orphan closing delimiters (from Toxic's error recovery) - skip with error
+      State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) ->
+        token = State.current(state)
+        state = State.add_error(state, "unexpected #{inspect(token.kind)}")
+        {state, _} = State.advance(state)
+        {state, nil}
+
+      # Stray block keywords from incomplete structures - skip with error
+      State.at_any?(state, [:do, :rescue, :catch, :else, :after]) ->
+        token = State.current(state)
+        state = State.add_error(state, "unexpected #{token.kind}")
         {state, _} = State.advance(state)
         {state, nil}
 
@@ -143,11 +175,20 @@ defmodule Hurricane.Parser.Structure do
 
   defp parse_module_body(state) do
     {state, items} = parse_module_body_items(state, [])
-    ast = Ast.block(Enum.reverse(items), [])
+    # Empty module bodies must be {:__block__, [], []} not nil
+    ast =
+      case Enum.reverse(items) do
+        [] -> {:__block__, [], []}
+        exprs -> Ast.block(exprs, [])
+      end
+
     {state, ast}
   end
 
   defp parse_module_body_items(state, acc) do
+    # Skip any semicolons (expression separators)
+    state = skip_semicolons(state)
+
     cond do
       State.at?(state, :end) or State.at_end?(state) ->
         {state, acc}
@@ -159,6 +200,9 @@ defmodule Hurricane.Parser.Structure do
         state = State.advance_push(state)
         {state, item} = parse_module_body_item(state)
         state = State.advance_pop!(state)
+
+        # Add end_of_expression metadata if followed by newline
+        item = add_end_of_expression(state, item)
 
         acc = if item, do: [item | acc], else: acc
         parse_module_body_items(state, acc)
@@ -179,11 +223,14 @@ defmodule Hurricane.Parser.Structure do
       State.at?(state, :defguardp) and not is_paren_call -> parse_def(state, :defguardp)
       State.at?(state, :defdelegate) and not is_paren_call -> parse_defdelegate(state)
       State.at?(state, :defmodule) and not is_paren_call -> parse_defmodule(state)
-      State.at?(state, :@) -> parse_attribute(state)
+      # @ goes through Expression for proper infix handling (e.g., @foo + 1)
       State.at?(state, :use) and not is_paren_call -> parse_directive(state, :use)
       State.at?(state, :import) and not is_paren_call -> parse_directive(state, :import)
       State.at?(state, :alias_directive) and not is_paren_call -> parse_directive(state, :alias)
       State.at?(state, :require) and not is_paren_call -> parse_directive(state, :require)
+      # Module attributes: @doc, @moduledoc, @spec, @type, etc.
+      # Parse as expression (@ is a prefix operator) - must come before recovery check
+      State.at?(state, :@) -> Expression.parse_expression(state)
       Recovery.at_recovery?(state, Recovery.module_body()) -> {state, nil}
       # Any other token: try to parse as expression
       true -> Expression.parse_expression(state)
@@ -438,7 +485,7 @@ defmodule Hurricane.Parser.Structure do
         {state, expr} = parse_block_body_item(state)
         state = State.advance_pop!(state)
 
-        acc = if expr, do: [expr | acc], else: acc
+        acc = if expr != nil, do: [expr | acc], else: acc
         parse_block_body_items(state, acc)
     end
   end
@@ -447,48 +494,8 @@ defmodule Hurricane.Parser.Structure do
     Expression.parse_expression(state)
   end
 
-  ## MODULE ATTRIBUTES
-
-  defp parse_attribute(state) do
-    {state, at_token} = State.expect(state, :@)
-    meta = Ast.token_meta(at_token)
-
-    # Parse attribute name
-    {state, name_ast} =
-      if State.at?(state, :identifier) do
-        token = State.current(state)
-        {state, _} = State.advance(state)
-        name_meta = Ast.token_meta(token)
-
-        # Check if there's a value
-        if State.at_any?(state, [
-             :string,
-             :integer,
-             :atom,
-             :identifier,
-             :alias,
-             :lbracket,
-             :lbrace,
-             true,
-             false,
-             nil
-           ]) or
-             State.at?(state, :lparen) do
-          # Has value - parse as call
-          {state, value} = Expression.parse_expression(state)
-          {state, Ast.call(token.value, name_meta, [value])}
-        else
-          # No value - reference
-          {state, Ast.var(token.value, name_meta)}
-        end
-      else
-        state = State.add_error(state, "expected attribute name")
-        {state, Ast.error(State.current_meta(state))}
-      end
-
-    ast = Ast.attribute(name_ast, meta)
-    {state, ast}
-  end
+  # Note: Module attributes (@) are handled by Expression.parse_expression
+  # via parse_prefix_op, ensuring proper infix handling (e.g., @foo + 1)
 
   ## DIRECTIVES (use, import, alias, require)
 
@@ -529,4 +536,27 @@ defmodule Hurricane.Parser.Structure do
       end
     end
   end
+
+  # Add end_of_expression metadata to an expression
+  # This tracks where expressions end for formatter purposes
+  defp add_end_of_expression(_state, nil), do: nil
+
+  defp add_end_of_expression(state, {name, meta, args}) when is_atom(name) and is_list(meta) do
+    prev_token = State.prev(state)
+    newlines = State.newlines_before(state)
+
+    if newlines > 0 and prev_token != nil do
+      eoe_meta = [
+        newlines: newlines,
+        line: prev_token.end_line,
+        column: prev_token.end_column
+      ]
+
+      {name, [{:end_of_expression, eoe_meta} | meta], args}
+    else
+      {name, meta, args}
+    end
+  end
+
+  defp add_end_of_expression(_state, expr), do: expr
 end

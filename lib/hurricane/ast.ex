@@ -50,6 +50,12 @@ defmodule Hurricane.Ast do
   """
   def block([], _meta), do: nil
 
+  # unquote_splicing must always be wrapped in a block because it can expand
+  # to multiple expressions at compile time
+  def block([{:unquote_splicing, _, _} = single], _meta) do
+    {:__block__, [], [single]}
+  end
+
   def block([single], _meta), do: single
 
   def block(exprs, meta) when is_list(exprs) do

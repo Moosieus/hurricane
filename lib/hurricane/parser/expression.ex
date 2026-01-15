@@ -27,8 +27,8 @@ defmodule Hurricane.Parser.Expression do
     :when => {11, 10},
     # Type annotation
     :"::" => {13, 12},
-    # Comprehension, with
-    :<- => {17, 16},
+    # Comprehension, with (left-associative)
+    :<- => {16, 17},
     # Match
     := => {19, 18},
 
@@ -53,8 +53,16 @@ defmodule Hurricane.Parser.Expression do
     :<= => {27, 28},
     :>= => {27, 28},
 
-    # Pipe (left-associative)
+    # Pipe and arrow operators (left-associative)
     :|> => {29, 30},
+    :~>> => {29, 30},
+    :<<~ => {29, 30},
+    :~> => {29, 30},
+    :<~ => {29, 30},
+    :<~> => {29, 30},
+    :"<|>" => {29, 30},
+    :<<< => {29, 30},
+    :>>> => {29, 30},
 
     # Membership
     :in => {31, 32},
@@ -91,8 +99,9 @@ defmodule Hurricane.Parser.Expression do
 
   # Prefix operators: right binding power only
   @prefix_bp %{
-    :! => 55,
-    :not => 55,
+    # `!` and `not` have low bp so `!a in b` parses as `!(a in b)`, not `(!a) in b`
+    :! => 30,
+    :not => 30,
     :"~~~" => 55,
     # Pin
     :^ => 57,
@@ -136,6 +145,14 @@ defmodule Hurricane.Parser.Expression do
     token = State.current(state)
 
     cond do
+      # Ellipsis operator - can stand alone or take an argument
+      State.at?(state, :ellipsis_op) ->
+        parse_ellipsis(state)
+
+      # Range operator standalone - just the .. without operands
+      State.at?(state, :..) ->
+        parse_range_standalone(state)
+
       # Prefix operators
       prefix_op?(token) ->
         parse_prefix_op(state)
@@ -146,6 +163,10 @@ defmodule Hurricane.Parser.Expression do
         {state, token.value}
 
       State.at?(state, :float) ->
+        {state, _} = State.advance(state)
+        {state, token.value}
+
+      State.at?(state, :char) ->
         {state, _} = State.advance(state)
         {state, token.value}
 
@@ -163,9 +184,11 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :heredoc) ->
         parse_heredoc(state)
 
+      State.at?(state, :charlist_heredoc) ->
+        parse_charlist_heredoc(state)
+
       State.at?(state, :charlist) ->
-        {state, _} = State.advance(state)
-        {state, token.value}
+        parse_charlist(state)
 
       State.at?(state, true) ->
         {state, _} = State.advance(state)
@@ -331,6 +354,19 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :kw_identifier) ->
         parse_implicit_keyword_list(state)
 
+      # Lexer error token - record error and continue
+      State.at?(state, :error_token) ->
+        error = token.value
+
+        error_msg =
+          if is_struct(error) and Map.has_key?(error, :message),
+            do: error.message,
+            else: "lexer error"
+
+        state = State.add_error(state, error_msg)
+        {state, _} = State.advance(state)
+        {state, Ast.error_at(token)}
+
       # Recovery or end of expression
       Recovery.at_recovery?(state, Recovery.expression()) or State.at_end?(state) ->
         {state, nil}
@@ -355,8 +391,50 @@ defmodule Hurricane.Parser.Expression do
     # RHS of prefix op shouldn't consume do blocks - they belong to outer constructs
     # e.g., in `if !f(x) do 1 end`, the `do` belongs to `if`, not `f`
     {state, operand} = parse_expression(state, bp, allow_do: false)
+
+    # Special case: `not a in b` and `!a in b` - use `in`'s position
+    meta =
+      case {token.kind, operand} do
+        {:not, {:in, in_meta, _}} -> in_meta
+        {:!, {:in, in_meta, _}} -> in_meta
+        _ -> meta
+      end
+
     ast = Ast.unary_op(token.kind, meta, operand)
     {state, ast}
+  end
+
+  # Range operator standalone: .. without operands
+  # Produces: {:.., meta, []}
+  defp parse_range_standalone(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+    ast = {:.., meta, []}
+    {state, ast}
+  end
+
+  # Ellipsis operator: ... can stand alone or take an optional argument
+  # Standalone: {:..., meta, []}
+  # With arg: {:..., meta, [arg]}
+  defp parse_ellipsis(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+
+    # Check if there's an argument (identifier on same line, no newline)
+    if not State.newline_before?(state) and State.at?(state, :identifier) do
+      arg_token = State.current(state)
+      {state, _} = State.advance(state)
+      arg_meta = Ast.token_meta(arg_token)
+      arg = Ast.var(arg_token.value, arg_meta)
+      ast = {:..., meta, [arg]}
+      {state, ast}
+    else
+      # Standalone ellipsis
+      ast = {:..., meta, []}
+      {state, ast}
+    end
   end
 
   ## INFIX LOOP
@@ -403,12 +481,19 @@ defmodule Hurricane.Parser.Expression do
     {state, _} = State.advance(state)
     meta = Ast.token_meta(op_token)
 
+    # Check for newlines after the operator (before RHS)
+    # Elixir records this as `newlines: N` in operator metadata
+    # Note: dot operator does not get newlines metadata
+    newlines = State.newlines_before(state)
+    meta_with_newlines = if newlines > 0, do: [{:newlines, newlines} | meta], else: meta
+
     cond do
-      # Special handling for dot operator
+      # Special handling for dot operator (no newlines metadata)
       op_token.kind == :dot ->
         parse_dot_rhs(state, lhs, meta)
 
       # Special handling for "not in" - produces {:not, _, [{:in, _, [lhs, rhs]}]}
+      # Note: "not in" does not get newlines metadata
       op_token.kind == :"not in" ->
         # RHS of binary op shouldn't consume do blocks
         {state, rhs} = parse_expression(state, right_bp, allow_do: false)
@@ -416,10 +501,27 @@ defmodule Hurricane.Parser.Expression do
         ast = {:not, meta, [in_ast]}
         {state, ast}
 
+      # Special handling for range operator (..) - may become ternary step operator (..//)
+      op_token.kind == :.. ->
+        {state, rhs} = parse_expression(state, right_bp, allow_do: false)
+
+        # Check if followed by step operator (//)
+        if State.at?(state, :"//") do
+          {state, _step_token} = State.advance(state)
+          # Parse the step value with same binding power
+          {state, step} = parse_expression(state, right_bp, allow_do: false)
+          # Build ternary step operator: ..// (metadata from ..)
+          ast = {:..//, meta, [lhs, rhs, step]}
+          {state, ast}
+        else
+          ast = Ast.binary_op(:.., meta_with_newlines, lhs, rhs)
+          {state, ast}
+        end
+
       true ->
         # RHS of binary op shouldn't consume do blocks - they belong to outer constructs
         {state, rhs} = parse_expression(state, right_bp, allow_do: false)
-        ast = Ast.binary_op(op_token.kind, meta, lhs, rhs)
+        ast = Ast.binary_op(op_token.kind, meta_with_newlines, lhs, rhs)
         {state, ast}
     end
   end
@@ -458,22 +560,32 @@ defmodule Hurricane.Parser.Expression do
         id_meta = Ast.token_meta(id_token)
 
         # Check for call with parens (from space: Foo.bar (x) - rare but valid)
-        if State.at?(state, :lparen) do
-          {state, _} = State.advance(state)
-          {state, args} = parse_call_args(state)
-          {state, closing} = State.expect(state, :rparen)
+        cond do
+          State.at?(state, :lparen) ->
+            {state, _} = State.advance(state)
+            {state, args} = parse_call_args(state)
+            {state, closing} = State.expect(state, :rparen)
 
-          # Use identifier position for call meta, not dot position
-          call_meta = if closing, do: Ast.with_closing(id_meta, closing), else: id_meta
-          dot_ast = {:., dot_meta, [lhs, name]}
-          ast = {dot_ast, call_meta, args}
-          {state, ast}
-        else
-          # Field access (no parens) - use identifier position with no_parens flag
-          call_meta = [{:no_parens, true} | id_meta]
-          dot_ast = {:., dot_meta, [lhs, name]}
-          ast = {dot_ast, call_meta, []}
-          {state, ast}
+            # Use identifier position for call meta, not dot position
+            call_meta = if closing, do: Ast.with_closing(id_meta, closing), else: id_meta
+            dot_ast = {:., dot_meta, [lhs, name]}
+            ast = {dot_ast, call_meta, args}
+            {state, ast}
+
+          # No-parens call: Foo.bar 1 or Foo.bar x: 1
+          # Must be on same line (no newline) and next token can start an argument
+          not State.newline_before?(state) and starts_no_paren_arg_strict?(state) ->
+            dot_ast = {:., dot_meta, [lhs, name]}
+            {state, args} = parse_no_paren_args(state, [])
+            ast = {dot_ast, id_meta, args}
+            {state, ast}
+
+          true ->
+            # Field access (no parens, no args) - use identifier position with no_parens flag
+            call_meta = [{:no_parens, true} | id_meta]
+            dot_ast = {:., dot_meta, [lhs, name]}
+            ast = {dot_ast, call_meta, []}
+            {state, ast}
         end
 
       # Remote bracket access: Foo.bar[key]
@@ -726,8 +838,10 @@ defmodule Hurricane.Parser.Expression do
       :do_identifier,
       :bracket_identifier,
       :op_identifier,
+      :kw_identifier,
       :charlist,
       :heredoc,
+      :charlist_heredoc,
       :sigil,
       :lbracket,
       :lbrace,
@@ -743,10 +857,11 @@ defmodule Hurricane.Parser.Expression do
       :not,
       :&,
       :^,
+      :@,
       # NOTE: :+ and :- are NOT here - they're ambiguous with infix
       # The tokenizer tells us via :op_identifier when they should be prefix
       :!,
-      :~~~
+      :"~~~"
     ])
   end
 
@@ -790,32 +905,20 @@ defmodule Hurricane.Parser.Expression do
   end
 
   # Check for and parse trailing do block, adding it to args
+  # Supports do/else/rescue/catch/after clauses
   defp maybe_parse_do_block(state, {name, meta, args}, original_meta) when is_list(args) do
     if State.at?(state, :do) do
       {state, do_token} = State.advance(state)
-      {state, body} = parse_block_until(state, [:else, :end])
+      # Stop at any clause keyword, not just else/end
+      {state, body} = parse_block_until(state, [:else, :rescue, :catch, :after, :end])
 
-      {state, else_body, end_token} =
-        if State.at?(state, :else) do
-          {state, _} = State.advance(state)
-          {state, else_body} = parse_block_until(state, [:end])
-          {state, end_token} = State.expect(state, :end)
-          {state, else_body, end_token}
-        else
-          {state, end_token} = State.expect(state, :end)
-          {state, nil, end_token}
-        end
+      # Parse optional clauses in order: rescue, catch, else, after
+      {state, clauses} = parse_do_block_clauses(state, do: body)
 
-      # Build the do block keyword list
-      do_kw =
-        if else_body do
-          [do: body, else: else_body]
-        else
-          [do: body]
-        end
+      {state, end_token} = State.expect(state, :end)
 
       call_meta = Ast.with_do_end(original_meta, do_token, end_token)
-      ast = {name, call_meta, args ++ [do_kw]}
+      ast = {name, call_meta, args ++ [clauses]}
       {state, ast}
     else
       {state, {name, meta, args}}
@@ -823,6 +926,34 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp maybe_parse_do_block(state, ast, _original_meta), do: {state, ast}
+
+  # Parse optional do block clauses (rescue, catch, else, after)
+  defp parse_do_block_clauses(state, acc) do
+    cond do
+      State.at?(state, :rescue) ->
+        {state, _} = State.advance(state)
+        {state, clauses} = parse_stab_clauses(state, [])
+        parse_do_block_clauses(state, acc ++ [rescue: clauses])
+
+      State.at?(state, :catch) ->
+        {state, _} = State.advance(state)
+        {state, clauses} = parse_stab_clauses(state, [])
+        parse_do_block_clauses(state, acc ++ [catch: clauses])
+
+      State.at?(state, :else) ->
+        {state, _} = State.advance(state)
+        {state, body} = parse_block_until(state, [:rescue, :catch, :after, :end])
+        parse_do_block_clauses(state, acc ++ [else: body])
+
+      State.at?(state, :after) ->
+        {state, _} = State.advance(state)
+        {state, body} = parse_block_until(state, [:end])
+        parse_do_block_clauses(state, acc ++ [after: body])
+
+      true ->
+        {state, acc}
+    end
+  end
 
   # Parse keyword calls like raise, throw, unquote etc.
   defp parse_keyword_call(state, name) do
@@ -904,8 +1035,77 @@ defmodule Hurricane.Parser.Expression do
   defp parse_heredoc(state) do
     token = State.current(state)
     {state, _} = State.advance(state)
-    # Heredocs are simple string values (already joined in lexer)
-    {state, token.value}
+
+    case token.value do
+      # New format with indent metadata
+      %{indent: indent, content: content} ->
+        case content do
+          # Simple heredoc - no interpolation
+          str when is_binary(str) ->
+            {state, str}
+
+          # Heredoc with interpolation - use existing interpolation handling
+          parts when is_list(parts) ->
+            meta = [
+              {:delimiter, "\"\"\""},
+              {:indentation, indent}
+              | Ast.token_meta(token)
+            ]
+
+            ast_parts = build_interpolation_parts(parts)
+            ast = {:<<>>, meta, ast_parts}
+            {state, ast}
+        end
+
+      # Old format - just string content
+      content when is_binary(content) ->
+        {state, content}
+
+      content when is_list(content) ->
+        # Already processed chardata
+        {state, IO.chardata_to_string(content)}
+    end
+  end
+
+  defp parse_charlist_heredoc(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+
+    case token.value do
+      # New format with indent metadata
+      %{indent: indent, content: content} ->
+        meta = [{:delimiter, "'''"}, {:indentation, indent} | Ast.token_meta(token)]
+
+        case content do
+          # Simple charlist heredoc - convert to charlist
+          str when is_binary(str) ->
+            {state, String.to_charlist(str)}
+
+          # Charlist with list content - already a charlist
+          chars when is_list(chars) ->
+            # Check for interpolation
+            has_interpolation? = Enum.any?(chars, &match?({{_, _, _}, {_, _, _}, _}, &1))
+
+            if has_interpolation? do
+              # Build List.to_charlist([parts]) wrapper
+              ast_parts = build_charlist_interpolation_parts(chars)
+              dot_ast = {:., [line: meta[:line], column: meta[:column]], [List, :to_charlist]}
+              call_ast = {dot_ast, meta, [ast_parts]}
+              {state, call_ast}
+            else
+              # Join and convert to charlist
+              joined = IO.chardata_to_string(chars)
+              {state, String.to_charlist(joined)}
+            end
+        end
+
+      # Old format - just content
+      content when is_binary(content) ->
+        {state, String.to_charlist(content)}
+
+      content when is_list(content) ->
+        {state, content}
+    end
   end
 
   defp parse_string(state) do
@@ -941,12 +1141,91 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
+  defp parse_charlist(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = [{:delimiter, "'"} | Ast.token_meta(token)]
+
+    case token.value do
+      # Simple charlist - no interpolation
+      charlist when is_list(charlist) and not is_tuple(hd(charlist)) ->
+        # Just a regular charlist like 'abc'
+        if Enum.all?(charlist, &is_integer/1) do
+          {state, charlist}
+        else
+          # Has interpolation parts
+          build_charlist_interpolation(state, charlist, meta)
+        end
+
+      parts when is_list(parts) ->
+        has_interpolation? = Enum.any?(parts, &match?({{_, _, _}, {_, _, _}, _}, &1))
+
+        if has_interpolation? do
+          build_charlist_interpolation(state, parts, meta)
+        else
+          # Just charlist parts, convert to charlist
+          joined =
+            Enum.map_join(parts, fn
+              str when is_binary(str) -> str
+              chars when is_list(chars) -> IO.chardata_to_string(chars)
+              _ -> ""
+            end)
+
+          {state, String.to_charlist(joined)}
+        end
+
+      other when is_list(other) ->
+        {state, other}
+
+      other ->
+        {state, String.to_charlist(to_string(other))}
+    end
+  end
+
+  defp build_charlist_interpolation(state, parts, meta) do
+    # Build List.to_charlist([parts]) call
+    ast_parts = build_charlist_interpolation_parts(parts)
+    dot_ast = {:., [line: meta[:line], column: meta[:column]], [List, :to_charlist]}
+    call_ast = {dot_ast, meta, [ast_parts]}
+    {state, call_ast}
+  end
+
+  defp build_charlist_interpolation_parts(parts) do
+    Enum.map(parts, fn
+      str when is_binary(str) ->
+        str
+
+      {{start_line, start_col, _}, {end_line, end_col, _}, tokens} ->
+        # Parse the interpolated tokens
+        parsed_expr = parse_interpolation_tokens(tokens)
+
+        # Build the Kernel.to_string call for interpolation
+        dot_meta = [line: start_line, column: start_col]
+
+        call_meta = [
+          from_interpolation: true,
+          closing: [line: end_line, column: end_col],
+          line: start_line,
+          column: start_col
+        ]
+
+        dot_ast = {:., dot_meta, [Kernel, :to_string]}
+        {dot_ast, call_meta, [parsed_expr]}
+
+      chars when is_list(chars) ->
+        IO.chardata_to_string(chars)
+
+      other ->
+        to_string(other)
+    end)
+  end
+
   defp build_interpolation_parts(parts) do
     Enum.map(parts, fn
       str when is_binary(str) ->
         str
 
-      {{start_line, start_col, _}, {_end_line, end_col, _}, tokens} ->
+      {{start_line, start_col, _}, {end_line, end_col, _}, tokens} ->
         # Parse the interpolated tokens
         parsed_expr = parse_interpolation_tokens(tokens)
 
@@ -955,7 +1234,7 @@ defmodule Hurricane.Parser.Expression do
 
         call_meta = [
           from_interpolation: true,
-          closing: [line: start_line, column: end_col],
+          closing: [line: end_line, column: end_col],
           line: start_line,
           column: start_col
         ]
@@ -969,8 +1248,8 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_interpolation_tokens(tokens) do
-    # Convert raw tokens to our Token structs and parse
-    normalized = Enum.map(tokens, &Hurricane.Token.from_raw/1)
+    # Convert Toxic ranged tokens to our Token structs and parse
+    normalized = Enum.map(tokens, &Hurricane.Token.from_toxic/1)
     normalized = normalized ++ [Hurricane.Token.eof(0, 0)]
 
     inner_state = %State{
@@ -980,8 +1259,93 @@ defmodule Hurricane.Parser.Expression do
       checkpoints: []
     }
 
-    {_state, ast} = parse_expression(inner_state, 0)
-    ast
+    # Track first token before skipping - used for empty block position if #{;}
+    first_token = State.current(inner_state)
+
+    # Skip leading semicolons/eol - #{;a} should parse as just `a`
+    inner_state = skip_leading_separators(inner_state)
+
+    # Check for special cases: empty #{} or just #{;}
+    current = State.current(inner_state)
+
+    cond do
+      # Empty interpolation #{} or just semicolon #{;}
+      current == nil or current.kind == :eof ->
+        # Use first token's position if it was a separator (#{;} case)
+        if first_token && (first_token.kind == :semicolon or first_token.kind == :eol) do
+          {:__block__, [line: first_token.line, column: first_token.column], []}
+        else
+          {:__block__, [], []}
+        end
+
+      true ->
+        # Parse all expressions separated by semicolons in interpolation
+        {_state, exprs} = parse_interpolation_exprs(inner_state, [])
+
+        case exprs do
+          [] -> {:__block__, [], []}
+          [single] -> single
+          multiple -> {:__block__, [], multiple}
+        end
+    end
+  end
+
+  # Parse all expressions in interpolation, handling semicolon separators
+  defp parse_interpolation_exprs(state, acc) do
+    if State.at?(state, :eof) or State.at_end?(state) do
+      {state, Enum.reverse(acc)}
+    else
+      {state, ast} = parse_expression(state, 0)
+
+      # Add end_of_expression if followed by semicolon
+      ast =
+        if ast != nil and State.at?(state, :semicolon) do
+          add_end_of_expression_semicolon(state, ast)
+        else
+          ast
+        end
+
+      acc = if ast != nil, do: [ast | acc], else: acc
+
+      # Skip semicolon and continue if there are more expressions
+      if State.at?(state, :semicolon) do
+        {state, _} = State.advance(state)
+        state = skip_leading_separators(state)
+        parse_interpolation_exprs(state, acc)
+      else
+        {state, Enum.reverse(acc)}
+      end
+    end
+  end
+
+  # Add end_of_expression metadata when followed by semicolon (newlines: 0)
+  defp add_end_of_expression_semicolon(state, {name, meta, args})
+       when is_atom(name) and is_list(meta) do
+    prev_token = State.prev(state)
+
+    if prev_token != nil do
+      eoe_meta = [
+        newlines: 0,
+        line: prev_token.end_line,
+        column: prev_token.end_column
+      ]
+
+      {name, [{:end_of_expression, eoe_meta} | meta], args}
+    else
+      {name, meta, args}
+    end
+  end
+
+  defp add_end_of_expression_semicolon(_state, expr), do: expr
+
+  # Skip leading semicolons and eol tokens in interpolation
+  defp skip_leading_separators(state) do
+    if State.at?(state, :semicolon) or State.at?(state, :eol) do
+      {state, _} = State.advance(state)
+      skip_leading_separators(state)
+    else
+      state
+    end
   end
 
   defp parse_atom_unsafe(state) do
@@ -1014,7 +1378,11 @@ defmodule Hurricane.Parser.Expression do
     {state, lbrace} = State.advance(state)
     meta = Ast.token_meta(lbrace)
     {state, elements} = parse_collection_elements(state, :rbrace)
-    {state, _rbrace} = State.expect(state, :rbrace)
+    {state, rbrace} = State.expect(state, :rbrace)
+    # Add closing metadata for tuples with 1 or 3+ elements (2-element tuples don't need it)
+    meta =
+      if rbrace != nil and length(elements) != 2, do: Ast.with_closing(meta, rbrace), else: meta
+
     ast = Ast.tuple(elements, meta)
     {state, ast}
   end
@@ -1024,12 +1392,107 @@ defmodule Hurricane.Parser.Expression do
     meta = Ast.token_meta(map_open)
     # Also consume the lbrace that follows %
     {state, _lbrace} = State.expect(state, :lbrace)
-    {state, pairs} = parse_map_pairs(state)
+
+    # Check for map update syntax: %{map | key: value}
+    # vs regular map syntax: %{a: 1} or %{"key" => value}
+    {state, content} =
+      cond do
+        State.at?(state, :rbrace) ->
+          # Empty map
+          {state, []}
+
+        State.at?(state, :kw_identifier) ->
+          # Keyword syntax - definitely not update syntax, parse as pairs
+          {state, pairs} = parse_map_pairs(state)
+          {state, pairs}
+
+        true ->
+          # Expression first - could be update syntax or arrow syntax
+          # Use binding power 10 so we stop before | (which has bp 9)
+          {state, first} = parse_expression(state, 10)
+
+          if State.at?(state, :|) do
+            # Map update syntax: %{base | updates}
+            {state, pipe_token} = State.advance(state)
+            pipe_meta = Ast.token_meta(pipe_token)
+            {state, updates} = parse_map_update_pairs(state)
+            pipe_expr = {:|, pipe_meta, [first, updates]}
+            {state, [pipe_expr]}
+          else
+            # Regular map with arrow syntax - first was a key
+            {state, first_pair} = finish_map_pair(state, first)
+            {state, rest} = parse_map_pairs_rest(state)
+            pairs = if first_pair, do: [first_pair | rest], else: rest
+            {state, pairs}
+          end
+      end
+
     {state, rbrace} = State.expect(state, :rbrace)
     # Add closing metadata
     meta = if rbrace, do: Ast.with_closing(meta, rbrace), else: meta
-    ast = Ast.map(pairs, meta)
+    ast = Ast.map(content, meta)
     {state, ast}
+  end
+
+  # Parse update pairs after the | in map update syntax
+  defp parse_map_update_pairs(state) do
+    {state, pairs} = parse_keyword_or_arrow_pairs(state, [])
+    {state, pairs}
+  end
+
+  defp parse_keyword_or_arrow_pairs(state, acc) do
+    if State.at?(state, :rbrace) or Recovery.at_recovery?(state, Recovery.collection()) do
+      {state, Enum.reverse(acc)}
+    else
+      {state, pair} = parse_single_map_pair(state)
+      acc = if pair, do: [pair | acc], else: acc
+
+      case State.eat(state, :comma) do
+        {:ok, state, _} ->
+          parse_keyword_or_arrow_pairs(state, acc)
+
+        {:error, state} ->
+          {state, Enum.reverse(acc)}
+      end
+    end
+  end
+
+  defp parse_single_map_pair(state) do
+    if State.at?(state, :kw_identifier) do
+      token = State.current(state)
+      {state, _} = State.advance(state)
+      {state, value} = parse_expression(state, 0)
+      {state, {token.value, value}}
+    else
+      {state, key} = parse_expression(state, 0)
+
+      if State.at?(state, :"=>") do
+        {state, _} = State.advance(state)
+        {state, value} = parse_expression(state, 0)
+        {state, {key, value}}
+      else
+        {state, {key, nil}}
+      end
+    end
+  end
+
+  # Finish parsing a map pair when we've already parsed the key
+  defp finish_map_pair(state, key) do
+    cond do
+      State.at?(state, :"=>") ->
+        {state, _} = State.advance(state)
+        {state, value} = parse_expression(state, 0)
+        {state, {key, value}}
+
+      State.at?(state, :comma) or State.at?(state, :rbrace) ->
+        # Key was actually a kw pair parsed as expression - this shouldn't happen
+        # for well-formed code, but handle it
+        {state, {key, nil}}
+
+      true ->
+        # Just have a key expression (error case or lonely expression)
+        {state, {key, nil}}
+    end
   end
 
   defp parse_sigil(state) do
@@ -1038,13 +1501,41 @@ defmodule Hurricane.Parser.Expression do
     meta = Ast.token_meta(token)
 
     # Extract sigil data from token value
-    %{sigil_name: sigil_name, content: content, modifiers: modifiers, delimiter: delimiter} = token.value
+    %{
+      sigil_name: sigil_name,
+      content: content,
+      modifiers: modifiers,
+      indentation: indentation,
+      delimiter: delimiter
+    } = token.value
 
     # Build metadata with delimiter
     meta = [{:delimiter, IO.chardata_to_string([delimiter])} | meta]
 
+    # Build content metadata - include indentation for heredoc sigils
+    # Heredoc delimiters are """ or '''
+    is_heredoc? = delimiter in [~c"\"\"\"", ~c"'''", "\"\"\"", "'''"]
+
+    content_meta =
+      if is_heredoc? and is_integer(indentation) do
+        [{:indentation, indentation} | Ast.token_meta(token)]
+      else
+        Ast.token_meta(token)
+      end
+
+    # Check for interpolation in content
+    has_interpolation? =
+      is_list(content) and Enum.any?(content, &match?({{_, _, _}, {_, _, _}, _}, &1))
+
     # Build content as binary node
-    content_ast = Ast.binary(content, Ast.token_meta(token))
+    content_ast =
+      if has_interpolation? do
+        # Process interpolation parts
+        ast_parts = build_interpolation_parts(content)
+        {:<<>>, content_meta, ast_parts}
+      else
+        Ast.binary(content, content_meta)
+      end
 
     # Modifiers as charlist (or empty list)
     mods = if modifiers == [], do: [], else: modifiers
@@ -1075,14 +1566,46 @@ defmodule Hurricane.Parser.Expression do
       end
 
     # Parse the map part - use lbrace position for map metadata
+    # Handle update syntax: %Foo{s | a: 1}
     {state, lbrace} = State.expect(state, :lbrace)
-    {state, pairs} = parse_map_pairs(state)
+
+    {state, content} =
+      cond do
+        State.at?(state, :rbrace) ->
+          # Empty struct
+          {state, []}
+
+        State.at?(state, :kw_identifier) ->
+          # Keyword syntax - not update syntax
+          {state, pairs} = parse_map_pairs(state)
+          {state, pairs}
+
+        true ->
+          # Expression first - could be update syntax
+          {state, first} = parse_expression(state, 10)
+
+          if State.at?(state, :|) do
+            # Struct update syntax: %Foo{base | updates}
+            {state, pipe_token} = State.advance(state)
+            pipe_meta = Ast.token_meta(pipe_token)
+            {state, updates} = parse_map_update_pairs(state)
+            pipe_expr = {:|, pipe_meta, [first, updates]}
+            {state, [pipe_expr]}
+          else
+            # Regular struct with arrow syntax
+            {state, first_pair} = finish_map_pair(state, first)
+            {state, rest} = parse_map_pairs_rest(state)
+            pairs = if first_pair, do: [first_pair | rest], else: rest
+            {state, pairs}
+          end
+      end
+
     {state, rbrace} = State.expect(state, :rbrace)
 
     # Build struct AST: {:%, meta, [alias, {:%{}, map_meta, pairs}]}
     map_meta = Ast.token_meta(lbrace)
     map_meta = if rbrace, do: Ast.with_closing(map_meta, rbrace), else: map_meta
-    map_ast = Ast.map(pairs, map_meta)
+    map_ast = Ast.map(content, map_meta)
     ast = Ast.struct(module_ast, map_ast, meta)
 
     {state, ast}
@@ -1228,12 +1751,205 @@ defmodule Hurricane.Parser.Expression do
 
   defp parse_parenthesized(state) do
     {state, lparen} = State.advance(state)
-    {state, expr} = parse_expression(state, 0)
-    {state, rparen} = State.expect(state, :rparen)
 
-    # Add parens metadata to the expression
-    expr = add_parens_meta(expr, lparen, rparen)
-    {state, expr}
+    # Check for empty parens first
+    if State.at?(state, :rparen) do
+      {state, rparen} = State.advance(state)
+
+      meta = [
+        closing: [line: rparen.line, column: rparen.column],
+        line: lparen.line,
+        column: lparen.column
+      ]
+
+      {state, {:__block__, meta, []}}
+    else
+      # Check for stab expression: (pattern -> body) or (-> body)
+      if State.at?(state, :->) do
+        # Bare stab: (-> body)
+        parse_paren_stab(state, [], lparen)
+      else
+        # Parse first expression
+        {state, first_expr} = parse_expression(state, 0)
+
+        cond do
+          # Check if this is a stab expression
+          State.at?(state, :->) ->
+            # This is a stab: (expr -> body) or (expr, expr -> body)
+            {state, patterns} = parse_more_patterns(state, [first_expr])
+            parse_paren_stab(state, patterns, lparen)
+
+          State.at?(state, :comma) ->
+            # Could be multi-pattern stab or just grouped expressions
+            {state, rest_exprs} = parse_comma_exprs(state)
+            all_exprs = [first_expr | rest_exprs]
+
+            if State.at?(state, :->) do
+              # It's a stab with multiple patterns
+              parse_paren_stab(state, all_exprs, lparen)
+            else
+              # Regular grouped expression with comma (like tuples, but in parens)
+              {state, rparen} = State.expect(state, :rparen)
+              expr = add_parens_meta(first_expr, lparen, rparen)
+              {state, expr}
+            end
+
+          true ->
+            # Regular parenthesized expression
+            {state, rparen} = State.expect(state, :rparen)
+            expr = add_parens_meta(first_expr, lparen, rparen)
+            {state, expr}
+        end
+      end
+    end
+  end
+
+  defp parse_comma_exprs(state) do
+    case State.eat(state, :comma) do
+      {:ok, state, _} ->
+        if State.at?(state, :->) or State.at?(state, :rparen) do
+          {state, []}
+        else
+          {state, expr} = parse_expression(state, 0)
+          {state, rest} = parse_comma_exprs(state)
+          exprs = if expr != nil, do: [expr | rest], else: rest
+          {state, exprs}
+        end
+
+      {:error, state} ->
+        {state, []}
+    end
+  end
+
+  defp parse_more_patterns(state, acc) do
+    # Check for comma-separated patterns before ->
+    case State.eat(state, :comma) do
+      {:ok, state, _} ->
+        if State.at?(state, :->) do
+          {state, Enum.reverse(acc)}
+        else
+          {state, pattern} = parse_expression(state, 0)
+          pattern_list = if pattern != nil, do: [pattern | acc], else: acc
+          parse_more_patterns(state, pattern_list)
+        end
+
+      {:error, state} ->
+        {state, Enum.reverse(acc)}
+    end
+  end
+
+  defp parse_paren_stab(state, patterns, _lparen) do
+    # Consume -> and parse body/clauses
+    {state, clauses} = parse_paren_stab_clauses(state, patterns)
+    {state, _rparen} = State.expect(state, :rparen)
+
+    # Elixir's AST for paren stab is just the list of clauses, not wrapped in block
+    # e.g., (1 -> 2) becomes [{:->, meta, [[1], 2]}]
+    {state, clauses}
+  end
+
+  defp parse_paren_stab_clauses(state, initial_patterns) do
+    {state, first_clause} = parse_single_stab_clause(state, initial_patterns)
+    {state, rest} = parse_more_paren_stab_clauses(state)
+    {state, [first_clause | rest]}
+  end
+
+  defp parse_single_stab_clause(state, patterns) do
+    {state, arrow} = State.expect(state, :->)
+    arrow_meta = Ast.token_meta(arrow)
+
+    # Check if patterns is a single empty block (from parsing `()`)
+    # In that case, it represents empty parens, not a block pattern
+    {actual_patterns, arrow_meta} =
+      case patterns do
+        [{:__block__, block_meta, []}] ->
+          # Empty parens - extract parens metadata and use [] as patterns
+          parens_meta =
+            [
+              line: block_meta[:line],
+              column: block_meta[:column]
+            ] ++ if block_meta[:closing], do: [closing: block_meta[:closing]], else: []
+
+          {[], [{:parens, parens_meta} | arrow_meta]}
+
+        _ ->
+          {patterns, arrow_meta}
+      end
+
+    # Parse body until ) or another clause pattern
+    {state, body_exprs} = parse_paren_stab_body(state, [])
+    body = Ast.block(Enum.reverse(body_exprs), [])
+
+    ast = Ast.stab(actual_patterns, body, arrow_meta)
+    {state, ast}
+  end
+
+  defp parse_paren_stab_body(state, acc) do
+    if State.at?(state, :rparen) or State.at_end?(state) or
+         looks_like_new_paren_stab_clause?(state) do
+      {state, acc}
+    else
+      state = State.advance_push(state)
+      {state, expr} = parse_expression(state, 0)
+      state = State.advance_pop!(state)
+
+      acc = if expr != nil, do: [expr | acc], else: acc
+      parse_paren_stab_body(state, acc)
+    end
+  end
+
+  defp looks_like_new_paren_stab_clause?(state) do
+    # Check if we're at the start of a new stab clause
+    # This typically happens after a semicolon with a -> coming up
+    token = State.current(state)
+    next = State.peek(state)
+
+    # Pattern: identifier/literal followed by ->
+    # or just -> for empty pattern
+    cond do
+      token && token.kind == :-> -> true
+      token && next && next.kind == :-> -> true
+      true -> false
+    end
+  end
+
+  defp parse_more_paren_stab_clauses(state) do
+    if State.at?(state, :rparen) or State.at_end?(state) do
+      {state, []}
+    else
+      # Check for semicolon separating clauses
+      state =
+        case State.eat(state, :semicolon) do
+          {:ok, state, _} -> state
+          {:error, state} -> state
+        end
+
+      if State.at?(state, :rparen) or State.at_end?(state) do
+        {state, []}
+      else
+        # Parse patterns for next clause
+        {state, patterns} = parse_paren_stab_patterns(state)
+
+        if State.at?(state, :->) do
+          {state, clause} = parse_single_stab_clause(state, patterns)
+          {state, rest} = parse_more_paren_stab_clauses(state)
+          {state, [clause | rest]}
+        else
+          {state, []}
+        end
+      end
+    end
+  end
+
+  defp parse_paren_stab_patterns(state) do
+    if State.at?(state, :->) do
+      {state, []}
+    else
+      {state, pattern} = parse_expression(state, 0)
+      {state, rest} = parse_more_patterns(state, [])
+      patterns = if pattern != nil, do: [pattern | rest], else: rest
+      {state, patterns}
+    end
   end
 
   defp add_parens_meta({name, meta, args}, lparen, rparen) when is_atom(name) and is_list(meta) do
@@ -1241,7 +1957,8 @@ defmodule Hurricane.Parser.Expression do
       [line: lparen.line, column: lparen.column] ++
         if rparen, do: [closing: [line: rparen.line, column: rparen.column]], else: []
 
-    meta = Keyword.put(meta, :parens, parens_meta)
+    # Prepend to allow multiple parens entries for nested parens
+    meta = [{:parens, parens_meta} | meta]
     {name, meta, args}
   end
 
@@ -1269,28 +1986,156 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_fn_clauses_rest(state) do
-    if State.at?(state, :end) or State.at_end?(state) do
-      {state, []}
+    # Multiple clauses are separated by semicolons OR newlines
+    cond do
+      # Explicit semicolon separator
+      State.at?(state, :semicolon) ->
+        {state, _} = State.advance(state)
+
+        if State.at?(state, :end) or State.at_end?(state) do
+          {state, []}
+        else
+          {state, clause} = parse_fn_clause(state)
+          {state, rest} = parse_fn_clauses_rest(state)
+          {state, [clause | rest]}
+        end
+
+      # Newline before current token and not at end - try another clause
+      # But only if there's a -> ahead (indicating a stab pattern)
+      State.newline_before?(state) and not State.at?(state, :end) and not State.at_end?(state) and
+          looks_like_fn_clause?(state) ->
+        {state, clause} = parse_fn_clause(state)
+        {state, rest} = parse_fn_clauses_rest(state)
+        {state, [clause | rest]}
+
+      true ->
+        {state, []}
+    end
+  end
+
+  # Check if we're at what looks like an fn clause pattern (has -> ahead)
+  defp looks_like_fn_clause?(state) do
+    # Scan ahead looking for -> before we hit end, =, or other clause terminators
+    scan_for_arrow(state, 0)
+  end
+
+  defp scan_for_arrow(state, depth) do
+    # Limit lookahead depth to avoid scanning too far
+    if depth > 50 do
+      false
     else
-      {state, clause} = parse_fn_clause(state)
-      {state, rest} = parse_fn_clauses_rest(state)
-      {state, [clause | rest]}
+      case State.current_kind(state) do
+        # Found the arrow - this is likely a clause
+        :-> ->
+          true
+
+        # Hit end of fn or file
+        :end ->
+          false
+
+        :eof ->
+          false
+
+        # Hit assignment operator - this is body code, not a pattern
+        := ->
+          false
+
+        # Hit a definition keyword - definitely not a pattern
+        k when k in [:def, :defp, :defmacro, :defmacrop, :defmodule] ->
+          false
+
+        # Continue scanning
+        _ ->
+          {state, _} = State.advance(state)
+          scan_for_arrow(state, depth + 1)
+      end
     end
   end
 
   defp parse_fn_clause(state) do
     # Parse patterns (parameters)
-    {state, patterns} = parse_fn_patterns(state)
+    # Check for explicit parens: fn () -> or fn (x) ->
+    {state, patterns, parens_meta} =
+      if State.at?(state, :lparen) do
+        lparen = State.current(state)
+        {state, _} = State.advance(state)
+
+        if State.at?(state, :rparen) do
+          # Empty parens: fn () ->
+          rparen = State.current(state)
+          {state, _} = State.advance(state)
+
+          parens = [
+            line: lparen.line,
+            column: lparen.column,
+            closing: [line: rparen.line, column: rparen.column]
+          ]
+
+          {state, [], parens}
+        else
+          # Parens with args: fn (x) ->
+          {state, inner_patterns} = parse_fn_patterns_inner(state)
+          {state, rparen} = State.expect(state, :rparen)
+
+          parens =
+            if rparen do
+              [
+                line: lparen.line,
+                column: lparen.column,
+                closing: [line: rparen.line, column: rparen.column]
+              ]
+            else
+              [line: lparen.line, column: lparen.column]
+            end
+
+          {state, inner_patterns, parens}
+        end
+      else
+        # No parens - regular patterns
+        {state, patterns} = parse_fn_patterns(state)
+        {state, patterns, nil}
+      end
 
     # Parse arrow
     {state, arrow_token} = State.expect(state, :->)
     meta = Ast.token_meta(arrow_token)
+    # Add parens metadata if we had explicit parens
+    meta = if parens_meta, do: [{:parens, parens_meta} | meta], else: meta
 
     # Parse body
     {state, body} = parse_fn_body(state)
 
     ast = Ast.stab(patterns, body, meta)
     {state, ast}
+  end
+
+  defp parse_fn_patterns_inner(state) do
+    if State.at?(state, :rparen) or State.at?(state, :->) or
+         Recovery.at_recovery?(state, Recovery.stab_clause()) do
+      {state, []}
+    else
+      {state, pattern} = parse_expression(state, 0)
+      {state, rest} = parse_fn_patterns_inner_rest(state)
+      patterns = if pattern, do: [pattern | rest], else: rest
+      {state, patterns}
+    end
+  end
+
+  defp parse_fn_patterns_inner_rest(state) do
+    case State.eat(state, :comma) do
+      {:ok, state, _} ->
+        if State.at?(state, :rparen) or Recovery.at_recovery?(state, Recovery.stab_clause()) do
+          {state, []}
+        else
+          {state, pattern} = parse_expression(state, 0)
+          {state, rest} = parse_fn_patterns_inner_rest(state)
+          patterns = if pattern, do: [pattern | rest], else: rest
+          {state, patterns}
+        end
+
+      {:error, state} ->
+        {state, []}
+    end
   end
 
   defp parse_fn_patterns(state) do
@@ -1329,48 +2174,24 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_fn_body_exprs(state, acc) do
-    if State.at?(state, :end) or State.at_end?(state) do
+    # Stop at end, semicolon (clause separator), arrow (new clause pattern), or eof
+    if State.at?(state, :end) or State.at?(state, :semicolon) or
+         State.at?(state, :->) or State.at_end?(state) do
       {state, acc}
     else
       state = State.advance_push(state)
       {state, expr} = parse_expression(state, 0)
       state = State.advance_pop!(state)
 
-      acc = if expr, do: [expr | acc], else: acc
+      acc = if expr != nil, do: [expr | acc], else: acc
 
-      # Check for new clause AFTER parsing, not before
-      if looks_like_new_clause?(state) do
+      # In fn bodies, newlines typically separate clauses, not expressions
+      # Only continue if we're on the same line or at explicit continuation
+      if State.newline_before?(state) and not State.at?(state, :semicolon) do
         {state, acc}
       else
         parse_fn_body_exprs(state, acc)
       end
-    end
-  end
-
-  defp looks_like_new_clause?(state) do
-    # Heuristic: if we're at an identifier/literal and there's a -> coming up soon
-    # This is imperfect but handles common cases
-    token = State.current(state)
-
-    if token && token.kind in [:identifier, :atom, :integer, :lbracket, :lbrace, :lparen] do
-      # Look for -> in next few tokens
-      peek_for_arrow(state, 0, 10)
-    else
-      false
-    end
-  end
-
-  defp peek_for_arrow(_state, depth, max) when depth >= max, do: false
-
-  defp peek_for_arrow(state, depth, max) do
-    tokens = state.tokens
-    pos = state.pos + depth
-
-    case Enum.at(tokens, pos) do
-      nil -> false
-      %{kind: :->} -> true
-      %{kind: :end} -> false
-      _ -> peek_for_arrow(state, depth + 1, max)
     end
   end
 
@@ -1392,6 +2213,9 @@ defmodule Hurricane.Parser.Expression do
       {:ok, state, _} ->
         # Comma consumed, now parse next arg
         if State.at?(state, :rparen) do
+          # Trailing comma - add error for strict conformance
+          # Format matches Elixir: message and token as separate parts
+          state = State.add_error(state, {"syntax error before: ", "')'"})
           {state, []}
         else
           state = State.advance_push(state)
@@ -1754,27 +2578,54 @@ defmodule Hurricane.Parser.Expression do
     end
   end
 
-  # quote do body end
+  # quote do body end  OR  quote do: expr
   defp parse_quote(state) do
     {state, quote_token} = State.advance(state)
     meta = Ast.token_meta(quote_token)
 
-    # Check for options
-    {state, opts} =
-      if State.at?(state, :do) do
-        {state, []}
-      else
+    # Check if next is kw_identifier with value :do (shorthand form: quote do: expr)
+    token = State.current(state)
+    is_shorthand_do = State.at?(state, :kw_identifier) and token != nil and token.value == :do
+
+    cond do
+      # Block form: quote do ... end
+      State.at?(state, :do) ->
+        {state, do_token} = State.advance(state)
+        {state, body} = parse_block_until(state, [:end])
+        {state, end_token} = State.expect(state, :end)
+        meta = Ast.with_do_end(meta, do_token, end_token)
+        ast = {:quote, meta, [[do: body]]}
+        {state, ast}
+
+      # Shorthand form: quote do: expr (kw_identifier with value :do)
+      is_shorthand_do ->
+        {state, kwargs} = parse_keyword_pairs(state)
+        ast = {:quote, meta, [kwargs]}
+        {state, ast}
+
+      # Block form with options: quote opts do ... end
+      State.at?(state, :kw_identifier) ->
+        # Parse options before do block
         {state, opts} = parse_keyword_pairs(state)
-        {state, opts}
-      end
+        {state, do_token} = State.expect(state, :do)
+        {state, body} = parse_block_until(state, [:end])
+        {state, end_token} = State.expect(state, :end)
+        meta = Ast.with_do_end(meta, do_token, end_token)
+        # Options are wrapped in a list
+        ast = {:quote, meta, [opts, [do: body]]}
+        {state, ast}
 
-    {state, do_token} = State.expect(state, :do)
-    {state, body} = parse_block_until(state, [:end])
-    {state, end_token} = State.expect(state, :end)
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    ast = {:quote, meta, opts ++ [[do: body]]}
-    {state, ast}
+      true ->
+        # Fallback - try to parse as options then do block
+        {state, opts} = parse_keyword_pairs(state)
+        {state, do_token} = State.expect(state, :do)
+        {state, body} = parse_block_until(state, [:end])
+        {state, end_token} = State.expect(state, :end)
+        meta = Ast.with_do_end(meta, do_token, end_token)
+        # Options are wrapped in a list
+        ast = {:quote, meta, [opts, [do: body]]}
+        {state, ast}
+    end
   end
 
   ## HELPER: PARSE BLOCK WITH STAB CLAUSES
@@ -1792,13 +2643,14 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_stab_clauses(state, acc) do
-    # Stop at block terminators or definition keywords (for recovery)
+    # Stop at block terminators, definition keywords (for recovery), or orphan delimiters
     if State.at?(state, :end) or State.at?(state, :else) or
          State.at?(state, :rescue) or State.at?(state, :catch) or
          State.at?(state, :after) or State.at_end?(state) or
          State.at?(state, :def) or State.at?(state, :defp) or
          State.at?(state, :defmacro) or State.at?(state, :defmacrop) or
-         State.at?(state, :defmodule) do
+         State.at?(state, :defmodule) or
+         State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) do
       {state, Enum.reverse(acc)}
     else
       state = State.advance_push(state)
@@ -1852,13 +2704,15 @@ defmodule Hurricane.Parser.Expression do
     # Stop at clause/block terminators, definition keywords (for recovery), or stab arrow
     # Note: We also stop at :-> because if we hit an arrow, the previous "expression"
     # was actually a pattern for a new stab clause, not part of this body
+    # Also stop at orphan delimiters which indicate parsing went wrong
     if State.at?(state, :end) or State.at?(state, :else) or
          State.at?(state, :rescue) or State.at?(state, :catch) or
          State.at?(state, :after) or State.at_end?(state) or
          State.at?(state, :->) or
          State.at?(state, :def) or State.at?(state, :defp) or
          State.at?(state, :defmacro) or State.at?(state, :defmacrop) or
-         State.at?(state, :defmodule) do
+         State.at?(state, :defmodule) or
+         State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) do
       {state, acc}
     else
       # Check for new stab clause BEFORE parsing the expression
@@ -1870,7 +2724,10 @@ defmodule Hurricane.Parser.Expression do
         {state, expr} = parse_expression(state, 0)
         state = State.advance_pop!(state)
 
-        acc = if expr, do: [expr | acc], else: acc
+        # Add end_of_expression metadata if followed by newline
+        expr = add_end_of_expression(state, expr)
+
+        acc = if expr != nil, do: [expr | acc], else: acc
         parse_stab_body_exprs(state, acc)
       end
     end
@@ -2002,8 +2859,37 @@ defmodule Hurricane.Parser.Expression do
       {state, expr} = parse_expression(state, 0)
       state = State.advance_pop!(state)
 
-      acc = if expr, do: [expr | acc], else: acc
+      # Add end_of_expression metadata if followed by newline or terminator
+      expr = add_end_of_expression(state, expr)
+
+      acc = if expr != nil, do: [expr | acc], else: acc
       parse_block_until_exprs(state, terminators, acc)
     end
   end
+
+  # Add end_of_expression metadata to an expression
+  # This tracks where expressions end for formatter purposes
+  defp add_end_of_expression(_state, nil), do: nil
+
+  defp add_end_of_expression(state, {name, meta, args}) when is_atom(name) and is_list(meta) do
+    # Get end position from previous token (the last token of the expression)
+    prev_token = State.prev(state)
+    newlines = State.newlines_before(state)
+
+    # Only add end_of_expression if there are newlines or it's followed by a terminator
+    if newlines > 0 and prev_token != nil do
+      eoe_meta = [
+        newlines: newlines,
+        line: prev_token.end_line,
+        column: prev_token.end_column
+      ]
+
+      {name, [{:end_of_expression, eoe_meta} | meta], args}
+    else
+      {name, meta, args}
+    end
+  end
+
+  # For non-standard AST forms (like plain values), return as-is
+  defp add_end_of_expression(_state, expr), do: expr
 end

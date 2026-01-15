@@ -99,6 +99,21 @@ defmodule Hurricane.Parser.State do
   end
 
   @doc """
+  Count the number of newlines between previous token and current token.
+  Returns 0 if no newlines, otherwise the line difference.
+  Used for metadata like `newlines: 1` on operators.
+  """
+  def newlines_before(state) do
+    case {prev(state), current(state)} do
+      {%{end_line: prev_end_line}, %{line: curr_line}} when curr_line > prev_end_line ->
+        curr_line - prev_end_line
+
+      _ ->
+        0
+    end
+  end
+
+  @doc """
   Get the kind of the current token.
   """
   def current_kind(state) do
@@ -157,15 +172,43 @@ defmodule Hurricane.Parser.State do
   Expect the current token to be of the given kind.
   Consumes it on success, emits error and continues on failure.
   Returns `{state, token | nil}`.
+
+  When Toxic inserts error_tokens followed by synthetic delimiters,
+  we need to skip past error_tokens to find the expected token.
   """
   def expect(state, kind) do
-    if at?(state, kind) do
-      advance(state)
-    else
-      token = current(state)
-      message = "expected #{inspect(kind)}, got #{inspect(token && token.kind)}"
-      state = add_error(state, message)
-      {state, nil}
+    cond do
+      at?(state, kind) ->
+        advance(state)
+
+      # Skip error_token and check if next token matches
+      # This handles Toxic's pattern of: error_token, synthetic_delimiter
+      at?(state, :error_token) ->
+        {state, error_token} = advance(state)
+        error = error_token.value
+
+        error_msg =
+          if is_struct(error) and Map.has_key?(error, :message),
+            do: error.message,
+            else: "lexer error"
+
+        state = add_error(state, error_msg)
+
+        # Now try to match the expected token
+        if at?(state, kind) do
+          advance(state)
+        else
+          token = current(state)
+          message = "expected #{inspect(kind)}, got #{inspect(token && token.kind)}"
+          state = add_error(state, message)
+          {state, nil}
+        end
+
+      true ->
+        token = current(state)
+        message = "expected #{inspect(kind)}, got #{inspect(token && token.kind)}"
+        state = add_error(state, message)
+        {state, nil}
     end
   end
 

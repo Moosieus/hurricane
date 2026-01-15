@@ -47,6 +47,8 @@ defmodule Hurricane.Parser.Recovery do
       :import,
       :alias_directive,
       :require,
+      # Stab arrow - indicates stray arrow from incomplete pattern
+      :->,
       :end,
       :eof
     ]
@@ -64,6 +66,13 @@ defmodule Hurricane.Parser.Recovery do
       :catch,
       :else,
       :after,
+      # Stab arrow - indicates stray arrow from incomplete pattern
+      :->,
+      # Orphan closing delimiters - should not be consumed by expression parser
+      :rparen,
+      :rbracket,
+      :rbrace,
+      :rangle,
       :eof
     ]
   end
@@ -79,12 +88,19 @@ defmodule Hurricane.Parser.Recovery do
       :catch,
       :else,
       :after,
+      # Stab arrow - indicates stray arrow from incomplete pattern
+      :->,
       # Definition keywords - indicate function body ended abnormally
       :def,
       :defp,
       :defmacro,
       :defmacrop,
       :defmodule,
+      # Orphan closing delimiters - should not be consumed by expression parser
+      :rparen,
+      :rbracket,
+      :rbrace,
+      :rangle,
       :eof
     ]
   end

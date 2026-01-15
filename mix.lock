@@ -1,0 +1,3 @@
+%{
+  "toxic": {:git, "https://github.com/lukaszsamson/toxic.git", "0ba27133f500b028631d7e6d9066542e8fef2fe5", []},
+}
