@@ -434,9 +434,33 @@ defmodule Hurricane.Parser.Structure do
 
     {state, alias_ast} = parse_module_alias(state)
 
-    # TODO: Parse options
+    # Parse options if present (comma followed by keyword list or expressions)
+    {state, args} =
+      if State.at?(state, :comma) do
+        {state, _comma} = State.advance(state)
+        {state, opts} = parse_directive_options(state, [])
+        {state, [alias_ast | opts]}
+      else
+        {state, [alias_ast]}
+      end
 
-    ast = Ast.call(kind, meta, [alias_ast])
+    ast = Ast.call(kind, meta, args)
     {state, ast}
+  end
+
+  defp parse_directive_options(state, acc) do
+    # Stop at module body tokens or end of expression
+    if State.at_any?(state, Recovery.module_body()) or State.at_end?(state) do
+      {state, Enum.reverse(acc)}
+    else
+      {state, expr} = Expression.parse_expression(state, 0)
+
+      if State.at?(state, :comma) do
+        {state, _comma} = State.advance(state)
+        parse_directive_options(state, [expr | acc])
+      else
+        {state, Enum.reverse([expr | acc])}
+      end
+    end
   end
 end
