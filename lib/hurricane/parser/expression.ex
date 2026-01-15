@@ -115,10 +115,16 @@ defmodule Hurricane.Parser.Expression do
 
   @doc """
   Parse an expression with given minimum binding power.
+
+  Options:
+  - `:allow_do` - whether to parse trailing do blocks (default: true)
+                  Set to false when parsing inside case/if/etc where do belongs to outer
   """
-  def parse_expression(state, min_bp \\ 0) do
+  def parse_expression(state, min_bp \\ 0, opts \\ []) do
+    allow_do = Keyword.get(opts, :allow_do, true)
+
     # 1. Parse prefix (atom, literal, unary op, parenthesized expr)
-    {state, lhs} = parse_prefix(state)
+    {state, lhs} = parse_prefix(state, allow_do)
 
     # 2. Loop: while next op binds tighter than min_bp
     parse_infix_loop(state, lhs, min_bp)
@@ -126,7 +132,7 @@ defmodule Hurricane.Parser.Expression do
 
   ## PREFIX PARSING
 
-  defp parse_prefix(state) do
+  defp parse_prefix(state, allow_do) do
     token = State.current(state)
 
     cond do
@@ -146,6 +152,10 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :atom) ->
         {state, _} = State.advance(state)
         {state, token.value}
+
+      State.at?(state, :atom_unsafe) ->
+        # Atom with interpolation like :"foo_#{x}"
+        parse_atom_unsafe(state)
 
       State.at?(state, :string) ->
         parse_string(state)
@@ -197,9 +207,25 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :quote) ->
         parse_quote(state)
 
-      # Identifiers and calls
+      # Identifiers and calls - different token types based on what follows
+      # Plain identifier: variable or no-paren call (space before any parens/brackets)
       State.at?(state, :identifier) ->
-        parse_identifier_or_call(state)
+        parse_identifier_or_call(state, allow_do)
+
+      # Paren identifier: foo( - identifier immediately followed by (
+      State.at?(state, :paren_identifier) ->
+        parse_paren_identifier(state, allow_do)
+
+      # Do identifier: foo do - identifier followed by do (no args)
+      # Behavior depends on allow_do flag:
+      # - allow_do=true: parse as zero-arg call with do block (foo do ... end)
+      # - allow_do=false: just return identifier, do belongs to outer (case foo do)
+      State.at?(state, :do_identifier) ->
+        parse_do_identifier(state, allow_do)
+
+      # Bracket identifier: foo[ - identifier immediately followed by [
+      State.at?(state, :bracket_identifier) ->
+        parse_bracket_identifier(state)
 
       # Special keywords that work like function calls
       State.at?(state, :raise) ->
@@ -229,6 +255,31 @@ defmodule Hurricane.Parser.Expression do
 
       State.at?(state, :alias_directive) ->
         parse_keyword_call(state, :alias)
+
+      # Definition keywords can appear as calls in desugared syntax: defmodule(...)
+      State.at?(state, :defmodule) ->
+        parse_keyword_call(state, :defmodule)
+
+      State.at?(state, :def) ->
+        parse_keyword_call(state, :def)
+
+      State.at?(state, :defp) ->
+        parse_keyword_call(state, :defp)
+
+      State.at?(state, :defmacro) ->
+        parse_keyword_call(state, :defmacro)
+
+      State.at?(state, :defmacrop) ->
+        parse_keyword_call(state, :defmacrop)
+
+      State.at?(state, :defdelegate) ->
+        parse_keyword_call(state, :defdelegate)
+
+      State.at?(state, :defguard) ->
+        parse_keyword_call(state, :defguard)
+
+      State.at?(state, :defguardp) ->
+        parse_keyword_call(state, :defguardp)
 
       # Module aliases
       State.at?(state, :alias) ->
@@ -344,13 +395,15 @@ defmodule Hurricane.Parser.Expression do
 
       # Special handling for "not in" - produces {:not, _, [{:in, _, [lhs, rhs]}]}
       op_token.kind == :"not in" ->
-        {state, rhs} = parse_expression(state, right_bp)
+        # RHS of binary op shouldn't consume do blocks
+        {state, rhs} = parse_expression(state, right_bp, allow_do: false)
         in_ast = {:in, meta, [lhs, rhs]}
         ast = {:not, meta, [in_ast]}
         {state, ast}
 
       true ->
-        {state, rhs} = parse_expression(state, right_bp)
+        # RHS of binary op shouldn't consume do blocks - they belong to outer constructs
+        {state, rhs} = parse_expression(state, right_bp, allow_do: false)
         ast = Ast.binary_op(op_token.kind, meta, lhs, rhs)
         {state, ast}
     end
@@ -362,14 +415,34 @@ defmodule Hurricane.Parser.Expression do
     token = State.current(state)
 
     cond do
-      # Remote call: Foo.bar or foo.bar
-      State.at?(state, :identifier) ->
+      # Remote call with parens: Foo.bar(args)
+      # :paren_identifier means identifier immediately followed by (
+      State.at?(state, :paren_identifier) ->
         id_token = token
         {state, _} = State.advance(state)
         name = id_token.value
         id_meta = Ast.token_meta(id_token)
 
-        # Check for call with parens
+        # Consume lparen and parse args
+        {state, _} = State.advance(state)
+        {state, args} = parse_call_args(state)
+        {state, closing} = State.expect(state, :rparen)
+
+        call_meta = if closing, do: Ast.with_closing(id_meta, closing), else: id_meta
+        dot_ast = {:., dot_meta, [lhs, name]}
+        ast = {dot_ast, call_meta, args}
+        {state, ast}
+
+      # Remote field access or no-paren call: Foo.bar
+      # Also handles :do_identifier - after a dot, the `do` belongs to outer construct
+      # e.g., `case user.provider do` - the do is for case, not provider
+      State.at_any?(state, [:identifier, :do_identifier]) ->
+        id_token = token
+        {state, _} = State.advance(state)
+        name = id_token.value
+        id_meta = Ast.token_meta(id_token)
+
+        # Check for call with parens (from space: Foo.bar (x) - rare but valid)
         if State.at?(state, :lparen) do
           {state, _} = State.advance(state)
           {state, args} = parse_call_args(state)
@@ -387,6 +460,21 @@ defmodule Hurricane.Parser.Expression do
           ast = {dot_ast, call_meta, []}
           {state, ast}
         end
+
+      # Remote bracket access: Foo.bar[key]
+      State.at?(state, :bracket_identifier) ->
+        id_token = token
+        {state, _} = State.advance(state)
+        name = id_token.value
+        id_meta = Ast.token_meta(id_token)
+
+        # Build the field access first
+        call_meta = [{:no_parens, true} | id_meta]
+        dot_ast = {:., dot_meta, [lhs, name]}
+        field_ast = {dot_ast, call_meta, []}
+
+        # The bracket is handled in postfix - just return the field access
+        {state, field_ast}
 
       # Multi-alias or tuple access: Foo.{A, B}
       State.at?(state, :lbrace) ->
@@ -500,26 +588,194 @@ defmodule Hurricane.Parser.Expression do
 
   ## ATOMS AND IDENTIFIERS
 
-  defp parse_identifier_or_call(state) do
+  # Plain identifier: either variable or no-paren call
+  # The tokenizer gives us :identifier when there's whitespace before parens/brackets
+  defp parse_identifier_or_call(state, allow_do) do
     token = State.current(state)
     {state, _} = State.advance(state)
     meta = Ast.token_meta(token)
 
-    # Check for call with parens
-    if State.at?(state, :lparen) do
-      {state, _} = State.advance(state)
-      {state, args} = parse_call_args(state)
-      {state, closing} = State.expect(state, :rparen)
-
-      call_meta = if closing, do: Ast.with_closing(meta, closing), else: meta
-      ast = Ast.call(token.value, call_meta, args)
-      {state, ast}
+    # No-parens call: identifier followed by arg on same line (no newline)
+    # Note: [list] after space IS an argument here (foo [1] is a call with list arg)
+    if not State.newline_before?(state) and starts_no_paren_arg?(state) do
+      {state, args} = parse_no_paren_args(state, [])
+      ast = Ast.call(token.value, meta, args)
+      # No-paren calls can have trailing do blocks (like `schema "users" do`)
+      # But only if allow_do is true
+      if allow_do do
+        maybe_parse_do_block(state, ast, meta)
+      else
+        {state, ast}
+      end
     else
       # Plain variable
       ast = Ast.var(token.value, meta)
       {state, ast}
     end
   end
+
+  # Paren identifier: foo( - identifier immediately followed by (
+  # This can have a do block after the closing paren: foo(1) do ... end
+  defp parse_paren_identifier(state, allow_do) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+
+    # Consume the lparen (tokenizer already verified it's there)
+    {state, _} = State.advance(state)
+    {state, args} = parse_call_args(state)
+    {state, closing} = State.expect(state, :rparen)
+
+    # Include closing metadata - this is preserved even if do block follows
+    call_meta = if closing, do: Ast.with_closing(meta, closing), else: meta
+    ast = Ast.call(token.value, call_meta, args)
+
+    # Paren calls CAN have do blocks: foo(1) do ... end
+    # But only if allow_do is true
+    if allow_do do
+      maybe_parse_do_block(state, ast, call_meta)
+    else
+      {state, ast}
+    end
+  end
+
+  # Do identifier: foo do - identifier followed by do with no arguments
+  # Behavior controlled by allow_do parameter:
+  # - allow_do=true: parse as zero-arg call with do block (foo do ... end)
+  # - allow_do=false: just return identifier, do belongs to outer construct
+  defp parse_do_identifier(state, allow_do) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+
+    if allow_do and State.at?(state, :do) do
+      # Parse as zero-arg call with do block: foo do ... end
+      call_ast = {token.value, meta, []}
+      maybe_parse_do_block(state, call_ast, meta)
+    else
+      # Return as plain variable - do belongs to outer construct (case/if/etc)
+      ast = Ast.var(token.value, meta)
+      {state, ast}
+    end
+  end
+
+  # Bracket identifier: foo[ - identifier immediately followed by [
+  # This is a variable with bracket access, NOT a call
+  # The bracket access is handled in postfix (maybe_parse_postfix)
+  defp parse_bracket_identifier(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+
+    # Return as variable - bracket access is handled in postfix parsing
+    ast = Ast.var(token.value, meta)
+    {state, ast}
+  end
+
+  # Check if current token can start a no-parens function argument
+  # :lbracket IS included because `foo [1, 2]` (with space) is a call with list arg
+  # The tokenizer distinguishes: foo[x] -> :bracket_identifier, foo [x] -> :identifier
+  defp starts_no_paren_arg?(state) do
+    State.at_any?(state, [
+      :string,
+      :integer,
+      :float,
+      :atom,
+      :alias,
+      :identifier,
+      :charlist,
+      :heredoc,
+      :sigil,
+      :lbracket,
+      :lbrace,
+      :map_open,
+      :percent,
+      :lparen,
+      :langle,
+      :fn,
+      :capture_int,
+      true,
+      false,
+      nil,
+      :not,
+      :&,
+      :^,
+      :-,
+      :+,
+      :!,
+      :~~~
+    ])
+  end
+
+  # Parse no-parens call arguments (similar to parse_keyword_call_args but simpler)
+  defp parse_no_paren_args(state, acc) do
+    # Stop at expression boundaries or do block
+    if State.at_any?(state, [:do, :end, :else, :rescue, :catch, :after]) or
+         State.at_end?(state) or State.newline_before?(state) do
+      {state, Enum.reverse(acc)}
+    else
+      {state, arg} = parse_call_arg(state)
+      acc = [arg | acc]
+
+      if State.at?(state, :comma) and not State.at?(State.peek(state) && state, :do) do
+        # Check if comma is followed by keyword (do:) which ends args
+        next = State.peek(state)
+
+        if next && next.kind == :kw_identifier do
+          # Keyword arg - parse it and we're done
+          {state, _comma} = State.advance(state)
+          {state, kw} = parse_trailing_keywords(state)
+          {state, Enum.reverse([kw | acc])}
+        else
+          {state, _comma} = State.advance(state)
+          parse_no_paren_args(state, acc)
+        end
+      else
+        {state, Enum.reverse(acc)}
+      end
+    end
+  end
+
+  # Parse trailing keyword arguments like `do: expr, else: expr`
+  defp parse_trailing_keywords(state) do
+    {state, pairs} = parse_keyword_pairs(state)
+    {state, pairs}
+  end
+
+  # Check for and parse trailing do block, adding it to args
+  defp maybe_parse_do_block(state, {name, meta, args}, original_meta) when is_list(args) do
+    if State.at?(state, :do) do
+      {state, do_token} = State.advance(state)
+      {state, body} = parse_block_until(state, [:else, :end])
+
+      {state, else_body, end_token} =
+        if State.at?(state, :else) do
+          {state, _} = State.advance(state)
+          {state, else_body} = parse_block_until(state, [:end])
+          {state, end_token} = State.expect(state, :end)
+          {state, else_body, end_token}
+        else
+          {state, end_token} = State.expect(state, :end)
+          {state, nil, end_token}
+        end
+
+      # Build the do block keyword list
+      do_kw =
+        if else_body do
+          [do: body, else: else_body]
+        else
+          [do: body]
+        end
+
+      call_meta = Ast.with_do_end(original_meta, do_token, end_token)
+      ast = {name, call_meta, args ++ [do_kw]}
+      {state, ast}
+    else
+      {state, {name, meta, args}}
+    end
+  end
+
+  defp maybe_parse_do_block(state, ast, _original_meta), do: {state, ast}
 
   # Parse keyword calls like raise, throw, unquote etc.
   defp parse_keyword_call(state, name) do
@@ -679,6 +935,23 @@ defmodule Hurricane.Parser.Expression do
     ast
   end
 
+  defp parse_atom_unsafe(state) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+    call_meta = [{:delimiter, "\""} | meta]
+
+    # Build the interpolated string
+    ast_parts = build_interpolation_parts(token.value)
+
+    # Wrap in {:erlang, :binary_to_atom} call
+    binary_ast = {:<<>>, meta, ast_parts}
+    dot_ast = {:., meta, [:erlang, :binary_to_atom]}
+    ast = {dot_ast, call_meta, [binary_ast, :utf8]}
+
+    {state, ast}
+  end
+
   ## COLLECTIONS
 
   defp parse_list(state) do
@@ -735,13 +1008,21 @@ defmodule Hurricane.Parser.Expression do
     {state, percent_token} = State.advance(state)
     meta = Ast.token_meta(percent_token)
 
-    # Parse the module alias
-    {state, alias_ast} =
-      if State.at?(state, :alias) do
-        parse_alias(state)
-      else
-        state = State.add_error(state, "expected module name after %")
-        {state, Ast.error(State.current_meta(state))}
+    # Parse the module - can be alias (Foo.Bar) or identifier (__MODULE__, var)
+    {state, module_ast} =
+      cond do
+        State.at?(state, :alias) ->
+          parse_alias(state)
+
+        State.at?(state, :identifier) ->
+          # Handle __MODULE__ and variable structs like %module{}
+          token = State.current(state)
+          {state, _} = State.advance(state)
+          {state, Ast.var(token.value, Ast.token_meta(token))}
+
+        true ->
+          state = State.add_error(state, "expected module name after %")
+          {state, Ast.error(State.current_meta(state))}
       end
 
     # Parse the map part - use lbrace position for map metadata
@@ -753,7 +1034,7 @@ defmodule Hurricane.Parser.Expression do
     map_meta = Ast.token_meta(lbrace)
     map_meta = if rbrace, do: Ast.with_closing(map_meta, rbrace), else: map_meta
     map_ast = Ast.map(pairs, map_meta)
-    ast = Ast.struct(alias_ast, map_ast, meta)
+    ast = Ast.struct(module_ast, map_ast, meta)
 
     {state, ast}
   end
@@ -775,10 +1056,10 @@ defmodule Hurricane.Parser.Expression do
     else
       {state, element} = parse_collection_element(state)
       {state, rest} = parse_collection_elements_rest(state, closing_kind)
-      # Keyword args return a list, need to flatten
+      # Only flatten keyword args (marked with :__kw__), not regular lists
       elements =
         case element do
-          pairs when is_list(pairs) -> pairs ++ rest
+          {:__kw__, pairs} -> pairs ++ rest
           single when not is_nil(single) -> [single | rest]
           nil -> rest
         end
@@ -795,10 +1076,10 @@ defmodule Hurricane.Parser.Expression do
         else
           {state, element} = parse_collection_element(state)
           {state, rest} = parse_collection_elements_rest(state, closing_kind)
-          # Keyword args return a list, need to flatten
+          # Only flatten keyword args (marked with :__kw__), not regular lists
           elements =
             case element do
-              pairs when is_list(pairs) -> pairs ++ rest
+              {:__kw__, pairs} -> pairs ++ rest
               single when not is_nil(single) -> [single | rest]
               nil -> rest
             end
@@ -814,7 +1095,9 @@ defmodule Hurricane.Parser.Expression do
   # Parse a single collection element (handles keyword pairs)
   defp parse_collection_element(state) do
     if State.at?(state, :kw_identifier) do
-      parse_keyword_args(state)
+      # Wrap keyword args in marker so we can flatten them correctly
+      {state, pairs} = parse_keyword_args(state)
+      {state, {:__kw__, pairs}}
     else
       parse_expression(state, 0)
     end
@@ -1125,7 +1408,8 @@ defmodule Hurricane.Parser.Expression do
     meta = Ast.token_meta(case_token)
 
     # Parse the expression being matched
-    {state, expr} = parse_expression(state, 0)
+    # Use allow_do: false because the `do` belongs to case, not the expression
+    {state, expr} = parse_expression(state, 0, allow_do: false)
 
     # Parse do block with stab clauses
     {state, clauses, do_token, end_token} = parse_stab_block(state)
@@ -1163,8 +1447,8 @@ defmodule Hurricane.Parser.Expression do
       ast = {:if, meta, [condition, kw_pairs]}
       {state, ast}
     else
-      # Parse condition
-      {state, condition} = parse_expression(state, 0)
+      # Parse condition - allow_do: false because do belongs to if
+      {state, condition} = parse_expression(state, 0, allow_do: false)
 
       # Check for do block or keyword form
       if State.at?(state, :do) do
@@ -1200,7 +1484,8 @@ defmodule Hurricane.Parser.Expression do
     {state, unless_token} = State.advance(state)
     meta = Ast.token_meta(unless_token)
 
-    {state, condition} = parse_expression(state, 0)
+    # allow_do: false because do belongs to unless
+    {state, condition} = parse_expression(state, 0, allow_do: false)
 
     if State.at?(state, :do) do
       {state, do_token} = State.advance(state)
@@ -1276,7 +1561,8 @@ defmodule Hurricane.Parser.Expression do
 
   defp parse_with_clause(state) do
     # Can be pattern <- expr or just expr (for guards)
-    {state, expr} = parse_expression(state, 0)
+    # allow_do: false because the do belongs to with, not the clause
+    {state, expr} = parse_expression(state, 0, allow_do: false)
     {state, expr}
   end
 
@@ -1381,7 +1667,8 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_for_clauses(state) do
-    {state, clause} = parse_expression(state, 0)
+    # allow_do: false because the do belongs to for, not the clause
+    {state, clause} = parse_expression(state, 0, allow_do: false)
 
     case State.eat(state, :comma) do
       {:ok, state, _} ->

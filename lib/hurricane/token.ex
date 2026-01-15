@@ -45,6 +45,10 @@ defmodule Hurricane.Token do
       {:list_heredoc, {line, column, _extra}, _indent, content} ->
         {:charlist_heredoc, content, line, column}
 
+      # Atoms with interpolation: {:atom_unsafe, pos, parts}
+      {:atom_unsafe, {line, column, _extra}, parts} ->
+        {:atom_unsafe, parts, line, column}
+
       # Two-element tokens (keywords, punctuation)
       {type, {line, column, _extra}} ->
         {normalize_kind(type, nil), nil, line, column}
@@ -68,11 +72,12 @@ defmodule Hurricane.Token do
   # Normalize token types to simpler kinds for the parser
   defp normalize_kind(type, value) do
     case type do
-      # Identifiers
+      # Identifiers - preserve whitespace-sensitive subtypes from tokenizer
+      # BUT check if the value is a keyword first (e.g., `cond do` makes cond a do_identifier)
       :identifier -> normalize_identifier(value)
-      :paren_identifier -> normalize_identifier(value)
-      :do_identifier -> normalize_identifier(value)
-      :bracket_identifier -> :identifier
+      :paren_identifier -> normalize_paren_identifier(value)
+      :do_identifier -> normalize_do_identifier(value)
+      :bracket_identifier -> normalize_bracket_identifier(value)
       :block_identifier -> normalize_block_identifier(value)
       :kw_identifier -> :kw_identifier
       :alias -> :alias
@@ -83,6 +88,7 @@ defmodule Hurricane.Token do
       :flt -> :float
       :char -> :char
       :atom -> :atom
+      :atom_quoted -> :atom
       :bin_string -> :string
       :list_string -> :charlist
       :bin_heredoc -> :heredoc
@@ -191,6 +197,38 @@ defmodule Hurricane.Token do
 
   defp normalize_identifier(_), do: :identifier
 
+  # Normalize paren_identifier - preserve unless it's a keyword
+  # e.g., `if(x)` - `if` should be :if, not :paren_identifier
+  defp normalize_paren_identifier(value) when is_atom(value) do
+    case normalize_identifier(value) do
+      :identifier -> :paren_identifier
+      keyword -> keyword
+    end
+  end
+
+  defp normalize_paren_identifier(_), do: :paren_identifier
+
+  # Normalize do_identifier - preserve unless it's a keyword
+  # e.g., `cond do` - `cond` should be :cond, not :do_identifier
+  defp normalize_do_identifier(value) when is_atom(value) do
+    case normalize_identifier(value) do
+      :identifier -> :do_identifier
+      keyword -> keyword
+    end
+  end
+
+  defp normalize_do_identifier(_), do: :do_identifier
+
+  # Normalize bracket_identifier - preserve unless it's a keyword
+  defp normalize_bracket_identifier(value) when is_atom(value) do
+    case normalize_identifier(value) do
+      :identifier -> :bracket_identifier
+      keyword -> keyword
+    end
+  end
+
+  defp normalize_bracket_identifier(_), do: :bracket_identifier
+
   # Block identifiers are special keywords in block contexts
   defp normalize_block_identifier(value) when is_atom(value) do
     case value do
@@ -209,6 +247,8 @@ defmodule Hurricane.Token do
     case type do
       :identifier -> value
       :paren_identifier -> value
+      :do_identifier -> value
+      :bracket_identifier -> value
       :kw_identifier -> value
       :alias -> value
       :int -> parse_integer(value)
@@ -225,13 +265,13 @@ defmodule Hurricane.Token do
   end
 
   defp parse_integer(charlist) when is_list(charlist) do
-    charlist |> List.to_string() |> String.to_integer()
+    charlist |> List.to_string() |> String.replace("_", "") |> String.to_integer()
   end
 
   defp parse_integer(value), do: value
 
   defp parse_float(charlist) when is_list(charlist) do
-    charlist |> List.to_string() |> String.to_float()
+    charlist |> List.to_string() |> String.replace("_", "") |> String.to_float()
   end
 
   defp parse_float(value), do: value

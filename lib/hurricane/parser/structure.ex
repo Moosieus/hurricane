@@ -41,29 +41,34 @@ defmodule Hurricane.Parser.Structure do
   end
 
   defp parse_top_level_item(state) do
+    # Check if next token is ( - if so, this is desugared call syntax like defmodule(...)
+    # which should be parsed as a regular expression, not special form
+    next = State.peek(state)
+    is_paren_call = next && next.kind == :lparen
+
     cond do
-      State.at?(state, :defmodule) ->
+      State.at?(state, :defmodule) and not is_paren_call ->
         parse_defmodule(state)
 
-      State.at?(state, :def) ->
+      State.at?(state, :def) and not is_paren_call ->
         parse_def(state, :def)
 
-      State.at?(state, :defp) ->
+      State.at?(state, :defp) and not is_paren_call ->
         parse_def(state, :defp)
 
-      State.at?(state, :defmacro) ->
+      State.at?(state, :defmacro) and not is_paren_call ->
         parse_def(state, :defmacro)
 
-      State.at?(state, :defmacrop) ->
+      State.at?(state, :defmacrop) and not is_paren_call ->
         parse_def(state, :defmacrop)
 
-      State.at?(state, :defguard) ->
+      State.at?(state, :defguard) and not is_paren_call ->
         parse_def(state, :defguard)
 
-      State.at?(state, :defguardp) ->
+      State.at?(state, :defguardp) and not is_paren_call ->
         parse_def(state, :defguardp)
 
-      State.at?(state, :defdelegate) ->
+      State.at?(state, :defdelegate) and not is_paren_call ->
         parse_defdelegate(state)
 
       State.at?(state, :@) ->
@@ -161,20 +166,24 @@ defmodule Hurricane.Parser.Structure do
   end
 
   defp parse_module_body_item(state) do
+    # Check if next token is ( - if so, this is desugared call syntax
+    next = State.peek(state)
+    is_paren_call = next && next.kind == :lparen
+
     cond do
-      State.at?(state, :def) -> parse_def(state, :def)
-      State.at?(state, :defp) -> parse_def(state, :defp)
-      State.at?(state, :defmacro) -> parse_def(state, :defmacro)
-      State.at?(state, :defmacrop) -> parse_def(state, :defmacrop)
-      State.at?(state, :defguard) -> parse_def(state, :defguard)
-      State.at?(state, :defguardp) -> parse_def(state, :defguardp)
-      State.at?(state, :defdelegate) -> parse_defdelegate(state)
-      State.at?(state, :defmodule) -> parse_defmodule(state)
+      State.at?(state, :def) and not is_paren_call -> parse_def(state, :def)
+      State.at?(state, :defp) and not is_paren_call -> parse_def(state, :defp)
+      State.at?(state, :defmacro) and not is_paren_call -> parse_def(state, :defmacro)
+      State.at?(state, :defmacrop) and not is_paren_call -> parse_def(state, :defmacrop)
+      State.at?(state, :defguard) and not is_paren_call -> parse_def(state, :defguard)
+      State.at?(state, :defguardp) and not is_paren_call -> parse_def(state, :defguardp)
+      State.at?(state, :defdelegate) and not is_paren_call -> parse_defdelegate(state)
+      State.at?(state, :defmodule) and not is_paren_call -> parse_defmodule(state)
       State.at?(state, :@) -> parse_attribute(state)
-      State.at?(state, :use) -> parse_directive(state, :use)
-      State.at?(state, :import) -> parse_directive(state, :import)
-      State.at?(state, :alias_directive) -> parse_directive(state, :alias)
-      State.at?(state, :require) -> parse_directive(state, :require)
+      State.at?(state, :use) and not is_paren_call -> parse_directive(state, :use)
+      State.at?(state, :import) and not is_paren_call -> parse_directive(state, :import)
+      State.at?(state, :alias_directive) and not is_paren_call -> parse_directive(state, :alias)
+      State.at?(state, :require) and not is_paren_call -> parse_directive(state, :require)
       Recovery.at_recovery?(state, Recovery.module_body()) -> {state, nil}
       # Any other token: try to parse as expression
       true -> Expression.parse_expression(state)
@@ -302,7 +311,14 @@ defmodule Hurricane.Parser.Structure do
 
   defp parse_function_name(state) do
     cond do
+      # Plain identifier: def foo, def foo()
       State.at?(state, :identifier) ->
+        token = State.current(state)
+        {state, _} = State.advance(state)
+        {state, Ast.var(token.value, Ast.token_meta(token))}
+
+      # Paren identifier: def foo() - identifier immediately followed by (
+      State.at?(state, :paren_identifier) ->
         token = State.current(state)
         {state, _} = State.advance(state)
         {state, Ast.var(token.value, Ast.token_meta(token))}
