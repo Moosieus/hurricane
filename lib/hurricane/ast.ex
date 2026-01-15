@@ -68,12 +68,13 @@ defmodule Hurricane.Ast do
   """
   def alias_node(segments, meta, last_token \\ nil) when is_list(segments) do
     # Elixir includes 'last' metadata for the last segment position
-    meta = if last_token do
-      last_meta = token_meta(last_token)
-      [{:last, last_meta} | meta]
-    else
-      meta
-    end
+    meta =
+      if last_token do
+        last_meta = token_meta(last_token)
+        [{:last, last_meta} | meta]
+      else
+        meta
+      end
 
     {:__aliases__, meta, segments}
   end

@@ -20,80 +20,91 @@ defmodule Hurricane.Parser.Expression do
   # Listed from lowest to highest precedence
   @infix_bp %{
     # Right-associative (left > right)
-    :\\     => {5, 4},      # Default argument
-    :|      => {9, 8},      # Cons
+    # Default argument
+    :\\ => {5, 4},
+    # Cons
+    :| => {9, 8},
     # NOTE: :-> is NOT an infix operator - it's handled explicitly by stab clause parsing
-    :when   => {11, 10},    # Guard
-    :"::"   => {13, 12},    # Type annotation
-    :<-     => {17, 16},    # Comprehension, with
-    :=      => {19, 18},    # Match
+    # Guard
+    :when => {11, 10},
+    # Type annotation
+    :"::" => {13, 12},
+    # Comprehension, with
+    :<- => {17, 16},
+    # Match
+    := => {19, 18},
 
     # Left-associative (right > left)
-    :||     => {21, 22},
-    :|||    => {21, 22},
-    :or     => {21, 22},
-    :&&     => {23, 24},
-    :&&&    => {23, 24},
-    :and    => {23, 24},
+    :|| => {21, 22},
+    :||| => {21, 22},
+    :or => {21, 22},
+    :&& => {23, 24},
+    :&&& => {23, 24},
+    :and => {23, 24},
 
     # Comparison (left-associative)
-    :==     => {25, 26},
-    :!=     => {25, 26},
-    :=~     => {25, 26},
-    :===    => {25, 26},
-    :!==    => {25, 26},
+    :== => {25, 26},
+    :!= => {25, 26},
+    :=~ => {25, 26},
+    :=== => {25, 26},
+    :!== => {25, 26},
 
     # Relational (left-associative)
-    :<      => {27, 28},
-    :>      => {27, 28},
-    :<=     => {27, 28},
-    :>=     => {27, 28},
+    :< => {27, 28},
+    :> => {27, 28},
+    :<= => {27, 28},
+    :>= => {27, 28},
 
     # Pipe (left-associative)
-    :|>     => {29, 30},
+    :|> => {29, 30},
 
     # Membership
-    :in     => {31, 32},
+    :in => {31, 32},
 
     # Bitwise xor
-    :^^^    => {33, 34},
+    :"^^^" => {33, 34},
 
     # Concat (right-associative!)
-    :++     => {35, 34},
-    :--     => {35, 34},
-    :+++    => {35, 34},
-    :---    => {35, 34},
-    :<>     => {35, 34},
+    :++ => {35, 34},
+    :-- => {35, 34},
+    :+++ => {35, 34},
+    :--- => {35, 34},
+    :<> => {35, 34},
 
     # Range
-    :..     => {37, 36},
-    :"../"  => {37, 36},
+    :.. => {37, 36},
+    :"../" => {37, 36},
 
     # Arithmetic (left-associative)
-    :+      => {39, 40},
-    :-      => {39, 40},
+    :+ => {39, 40},
+    :- => {39, 40},
 
     # Multiply/divide (left-associative)
-    :*      => {41, 42},
-    :/      => {41, 42},
+    :* => {41, 42},
+    :/ => {41, 42},
 
     # Power (right-associative)
-    :**     => {43, 42},
+    :** => {43, 42},
 
     # Dot (highest infix precedence)
-    :dot    => {61, 62}
+    :dot => {61, 62}
   }
 
   # Prefix operators: right binding power only
   @prefix_bp %{
-    :!      => 55,
-    :not    => 55,
-    :~~~    => 55,
-    :^      => 57,      # Pin
-    :&      => 59,      # Capture
-    :-      => 53,      # Unary minus
-    :+      => 53,      # Unary plus
-    :@      => 63       # Module attribute
+    :! => 55,
+    :not => 55,
+    :"~~~" => 55,
+    # Pin
+    :^ => 57,
+    # Capture
+    :& => 59,
+    # Unary minus
+    :- => 53,
+    # Unary plus
+    :+ => 53,
+    # Module attribute
+    :@ => 63
   }
 
   # Postfix binding power (for calls and access)
@@ -160,26 +171,52 @@ defmodule Hurricane.Parser.Expression do
         {state, nil}
 
       # Special forms
-      State.at?(state, :case) -> parse_case(state)
-      State.at?(state, :cond) -> parse_cond(state)
-      State.at?(state, :if) -> parse_if(state)
-      State.at?(state, :unless) -> parse_unless(state)
-      State.at?(state, :with) -> parse_with(state)
-      State.at?(state, :try) -> parse_try(state)
-      State.at?(state, :receive) -> parse_receive(state)
-      State.at?(state, :for) -> parse_for(state)
-      State.at?(state, :quote) -> parse_quote(state)
+      State.at?(state, :case) ->
+        parse_case(state)
+
+      State.at?(state, :cond) ->
+        parse_cond(state)
+
+      State.at?(state, :if) ->
+        parse_if(state)
+
+      State.at?(state, :unless) ->
+        parse_unless(state)
+
+      State.at?(state, :with) ->
+        parse_with(state)
+
+      State.at?(state, :try) ->
+        parse_try(state)
+
+      State.at?(state, :receive) ->
+        parse_receive(state)
+
+      State.at?(state, :for) ->
+        parse_for(state)
+
+      State.at?(state, :quote) ->
+        parse_quote(state)
 
       # Identifiers and calls
       State.at?(state, :identifier) ->
         parse_identifier_or_call(state)
 
       # Special keywords that work like function calls
-      State.at?(state, :raise) -> parse_keyword_call(state, :raise)
-      State.at?(state, :reraise) -> parse_keyword_call(state, :reraise)
-      State.at?(state, :throw) -> parse_keyword_call(state, :throw)
-      State.at?(state, :unquote) -> parse_keyword_call(state, :unquote)
-      State.at?(state, :unquote_splicing) -> parse_keyword_call(state, :unquote_splicing)
+      State.at?(state, :raise) ->
+        parse_keyword_call(state, :raise)
+
+      State.at?(state, :reraise) ->
+        parse_keyword_call(state, :reraise)
+
+      State.at?(state, :throw) ->
+        parse_keyword_call(state, :throw)
+
+      State.at?(state, :unquote) ->
+        parse_keyword_call(state, :unquote)
+
+      State.at?(state, :unquote_splicing) ->
+        parse_keyword_call(state, :unquote_splicing)
 
       # Module aliases
       State.at?(state, :alias) ->
@@ -1049,7 +1086,7 @@ defmodule Hurricane.Parser.Expression do
     {state, body} = parse_block_until(state, [:rescue, :catch, :else, :after, :end])
 
     # Parse optional sections
-    {state, sections} = parse_try_sections(state, [do: body])
+    {state, sections} = parse_try_sections(state, do: body)
 
     {state, end_token} = State.expect(state, :end)
 

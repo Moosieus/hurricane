@@ -44,19 +44,33 @@ defmodule Hurricane.Parser.Structure do
 
   defp parse_top_level_item(state) do
     cond do
-      State.at?(state, :defmodule) -> parse_defmodule(state)
-      State.at?(state, :def) -> parse_def(state, :def)
-      State.at?(state, :defp) -> parse_def(state, :defp)
-      State.at?(state, :defmacro) -> parse_def(state, :defmacro)
-      State.at?(state, :defmacrop) -> parse_def(state, :defmacrop)
-      State.at?(state, :@) -> parse_attribute(state)
+      State.at?(state, :defmodule) ->
+        parse_defmodule(state)
+
+      State.at?(state, :def) ->
+        parse_def(state, :def)
+
+      State.at?(state, :defp) ->
+        parse_def(state, :defp)
+
+      State.at?(state, :defmacro) ->
+        parse_def(state, :defmacro)
+
+      State.at?(state, :defmacrop) ->
+        parse_def(state, :defmacrop)
+
+      State.at?(state, :@) ->
+        parse_attribute(state)
+
       # Stray :end tokens from incomplete structures - skip with error
       State.at?(state, :end) ->
         state = State.add_error(state, "unexpected end")
         {state, _} = State.advance(state)
         {state, nil}
+
       # Any other token: try to parse as expression
-      true -> Expression.parse_expression(state)
+      true ->
+        Expression.parse_expression(state)
     end
   end
 
@@ -180,7 +194,9 @@ defmodule Hurricane.Parser.Structure do
         {state, closing_token} = State.expect(state, :rparen)
 
         call_meta = name_ast_meta(name_ast)
-        call_meta = if closing_token, do: Ast.with_closing(call_meta, closing_token), else: call_meta
+
+        call_meta =
+          if closing_token, do: Ast.with_closing(call_meta, closing_token), else: call_meta
 
         case name_ast do
           {name, _meta, nil} when is_atom(name) ->
@@ -379,7 +395,18 @@ defmodule Hurricane.Parser.Structure do
         name_meta = Ast.token_meta(token)
 
         # Check if there's a value
-        if State.at_any?(state, [:string, :integer, :atom, :identifier, :alias, :lbracket, :lbrace, true, false, nil]) or
+        if State.at_any?(state, [
+             :string,
+             :integer,
+             :atom,
+             :identifier,
+             :alias,
+             :lbracket,
+             :lbrace,
+             true,
+             false,
+             nil
+           ]) or
              State.at?(state, :lparen) do
           # Has value - parse as call
           {state, value} = Expression.parse_expression(state)
@@ -412,5 +439,4 @@ defmodule Hurricane.Parser.Structure do
     ast = Ast.call(kind, meta, [alias_ast])
     {state, ast}
   end
-
 end

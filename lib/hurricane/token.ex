@@ -55,10 +55,8 @@ defmodule Hurricane.Token do
       :block_identifier -> normalize_block_identifier(value)
       :kw_identifier -> :kw_identifier
       :alias -> :alias
-
       # Anonymous function call: fun.(args)
       :dot_call_op -> :dot_call
-
       # Literals
       :int -> :integer
       :flt -> :float
@@ -68,7 +66,6 @@ defmodule Hurricane.Token do
       :list_string -> :charlist
       :bin_heredoc -> :heredoc
       :list_heredoc -> :charlist_heredoc
-
       # Operators - preserve the specific operator as the kind
       :match_op -> value
       :or_op -> value
@@ -93,7 +90,6 @@ defmodule Hurricane.Token do
       :range_op -> value
       :stab_op -> :->
       :when_op -> :when
-
       # Punctuation - use as-is
       :"(" -> :lparen
       :")" -> :rparen
@@ -107,20 +103,17 @@ defmodule Hurricane.Token do
       :. -> :dot
       :%{} -> :map_open
       :% -> :percent
-
       # Keywords
       :do -> :do
       :end -> :end
       :fn -> :fn
-      :true -> true
-      :false -> false
-      :nil -> nil
-
+      true -> true
+      false -> false
+      nil -> nil
       # Special
       :eol -> :eol
       :eof -> :eof
       :";" -> :semicolon
-
       # Pass through anything else
       other -> other
     end
