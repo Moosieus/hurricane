@@ -8,6 +8,27 @@ defmodule Hurricane.Parser.State do
   - Checkpoint stack (for detecting stuck parsers)
   - Accumulated errors
   - AST fragments being built
+
+  ## Advance Assertions
+
+  Every loop that parses items must use advance assertions to prevent infinite loops:
+
+      state = advance_push(state)
+      {state, item} = parse_item(state)
+      state = advance_pop!(state)  # Crashes immediately if stuck
+
+  If a function may legitimately exit without consuming tokens:
+
+      state = advance_push(state)
+      {state, result} = try_parse(state)
+      if consumed? do
+        state = advance_pop!(state)
+      else
+        state = advance_drop(state)  # Clear checkpoint, no assertion
+      end
+
+  This materializes the "must consume" contract in code rather than relying on
+  mental tracking of which functions advance vs. which may bail.
   """
 
   alias Hurricane.Token
@@ -224,6 +245,20 @@ defmodule Hurricane.Parser.State do
           """
         end
 
+        %{state | checkpoints: rest}
+    end
+  end
+
+  @doc """
+  Drop checkpoint without asserting progress.
+  Use for early returns when legitimately not consuming tokens.
+  """
+  def advance_drop(state) do
+    case state.checkpoints do
+      [] ->
+        raise "advance_drop called without matching advance_push"
+
+      [_start | rest] ->
         %{state | checkpoints: rest}
     end
   end

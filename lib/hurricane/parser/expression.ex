@@ -372,17 +372,24 @@ defmodule Hurricane.Parser.Expression do
     else
       case infix_bp(token) do
         {left_bp, right_bp} when left_bp >= min_bp ->
+          # Infix operator: must consume at least the operator token
+          state = State.advance_push(state)
           {state, lhs} = parse_infix_op(state, lhs, token, right_bp)
+          state = State.advance_pop!(state)
           parse_infix_loop(state, lhs, min_bp)
 
         _ ->
           # Check for postfix (call, access)
+          state = State.advance_push(state)
           {state, new_lhs} = maybe_parse_postfix(state, lhs, min_bp)
 
           # If postfix consumed something, continue the loop to check for more infix/postfix
           if new_lhs != lhs do
+            state = State.advance_pop!(state)
             parse_infix_loop(state, new_lhs, min_bp)
           else
+            # Legitimate exit: didn't consume anything
+            state = State.advance_drop(state)
             {state, lhs}
           end
       end
@@ -750,7 +757,9 @@ defmodule Hurricane.Parser.Expression do
          State.at_end?(state) or State.newline_before?(state) do
       {state, Enum.reverse(acc)}
     else
+      state = State.advance_push(state)
       {state, arg} = parse_call_arg(state)
+      state = State.advance_pop!(state)
       acc = [arg | acc]
 
       if State.at?(state, :comma) and not State.at?(State.peek(state) && state, :do) do
@@ -760,7 +769,9 @@ defmodule Hurricane.Parser.Expression do
         if next && next.kind == :kw_identifier do
           # Keyword arg - parse it and we're done
           {state, _comma} = State.advance(state)
+          state = State.advance_push(state)
           {state, kw} = parse_trailing_keywords(state)
+          state = State.advance_pop!(state)
           {state, Enum.reverse([kw | acc])}
         else
           {state, _comma} = State.advance(state)
@@ -842,7 +853,9 @@ defmodule Hurricane.Parser.Expression do
       {state, Enum.reverse(acc)}
     else
       # Use parse_call_arg to properly handle keyword arguments
+      state = State.advance_push(state)
       {state, arg} = parse_call_arg(state)
+      state = State.advance_pop!(state)
 
       # Keyword args return a keyword list, keep it as a single arg
       acc = [arg | acc]
@@ -1153,10 +1166,13 @@ defmodule Hurricane.Parser.Expression do
   defp parse_map_pairs_rest(state) do
     case State.eat(state, :comma) do
       {:ok, state, _} ->
+        # Comma consumed, now parse next pair
         if State.at?(state, :rbrace) or Recovery.at_recovery?(state, Recovery.collection()) do
           {state, []}
         else
+          state = State.advance_push(state)
           {state, pair} = parse_map_pair(state)
+          state = State.advance_pop!(state)
           {state, rest} = parse_map_pairs_rest(state)
           pairs = if pair, do: [pair | rest], else: rest
           {state, pairs}
@@ -1374,10 +1390,13 @@ defmodule Hurricane.Parser.Expression do
   defp parse_call_args_rest(state) do
     case State.eat(state, :comma) do
       {:ok, state, _} ->
+        # Comma consumed, now parse next arg
         if State.at?(state, :rparen) do
           {state, []}
         else
+          state = State.advance_push(state)
           {state, arg} = parse_call_arg(state)
+          state = State.advance_pop!(state)
           {state, rest} = parse_call_args_rest(state)
           args = if arg, do: [arg | rest], else: rest
           {state, args}
@@ -1623,26 +1642,34 @@ defmodule Hurricane.Parser.Expression do
   defp parse_try_sections(state, acc) do
     cond do
       State.at?(state, :rescue) ->
+        state = State.advance_push(state)
         {state, _} = State.advance(state)
         # Don't use parse_stab_block_inner - it expects :end
         # parse_stab_clauses stops at :catch/:after/:end
         {state, clauses} = parse_stab_clauses(state, [])
+        state = State.advance_pop!(state)
         # Append to end to preserve order: do, rescue, catch, else, after
         parse_try_sections(state, acc ++ [rescue: clauses])
 
       State.at?(state, :catch) ->
+        state = State.advance_push(state)
         {state, _} = State.advance(state)
         {state, clauses} = parse_stab_clauses(state, [])
+        state = State.advance_pop!(state)
         parse_try_sections(state, acc ++ [catch: clauses])
 
       State.at?(state, :else) ->
+        state = State.advance_push(state)
         {state, _} = State.advance(state)
         {state, clauses} = parse_stab_clauses(state, [])
+        state = State.advance_pop!(state)
         parse_try_sections(state, acc ++ [else: clauses])
 
       State.at?(state, :after) ->
+        state = State.advance_push(state)
         {state, _} = State.advance(state)
         {state, body} = parse_block_until(state, [:end])
+        state = State.advance_pop!(state)
         parse_try_sections(state, acc ++ [after: body])
 
       true ->
