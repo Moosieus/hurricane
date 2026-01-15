@@ -82,8 +82,8 @@ defmodule Hurricane.Parser.Expression do
     :* => {41, 42},
     :/ => {41, 42},
 
-    # Power (right-associative)
-    :** => {43, 42},
+    # Power (left-associative - despite math convention!)
+    :** => {43, 44},
 
     # Dot (highest infix precedence)
     :dot => {61, 62}
@@ -227,6 +227,12 @@ defmodule Hurricane.Parser.Expression do
       State.at?(state, :bracket_identifier) ->
         parse_bracket_identifier(state)
 
+      # Op identifier: foo +b - identifier followed by space then operator with no space after
+      # The tokenizer marks this as :op_identifier to indicate the operator should be prefix
+      # This is a no-parens call where the first arg starts with a unary operator
+      State.at?(state, :op_identifier) ->
+        parse_op_identifier(state, allow_do)
+
       # Special keywords that work like function calls
       State.at?(state, :raise) ->
         parse_keyword_call(state, :raise)
@@ -346,7 +352,9 @@ defmodule Hurricane.Parser.Expression do
     meta = Ast.token_meta(token)
     bp = Map.fetch!(@prefix_bp, token.kind)
 
-    {state, operand} = parse_expression(state, bp)
+    # RHS of prefix op shouldn't consume do blocks - they belong to outer constructs
+    # e.g., in `if !f(x) do 1 end`, the `do` belongs to `if`, not `f`
+    {state, operand} = parse_expression(state, bp, allow_do: false)
     ast = Ast.unary_op(token.kind, meta, operand)
     {state, ast}
   end
@@ -589,15 +597,19 @@ defmodule Hurricane.Parser.Expression do
   ## ATOMS AND IDENTIFIERS
 
   # Plain identifier: either variable or no-paren call
-  # The tokenizer gives us :identifier when there's whitespace before parens/brackets
+  # The tokenizer gives us :identifier when there's symmetric spacing around operators
+  # (e.g., "a + b" has space before AND after +, so a is :identifier)
+  # For asymmetric spacing ("foo +b"), the tokenizer gives us :op_identifier instead
   defp parse_identifier_or_call(state, allow_do) do
     token = State.current(state)
     {state, _} = State.advance(state)
     meta = Ast.token_meta(token)
 
     # No-parens call: identifier followed by arg on same line (no newline)
-    # Note: [list] after space IS an argument here (foo [1] is a call with list arg)
-    if not State.newline_before?(state) and starts_no_paren_arg?(state) do
+    # IMPORTANT: We use starts_no_paren_arg_strict? which excludes + and -
+    # The tokenizer handles the "foo +b" case via :op_identifier
+    # So for plain :identifier, we only check for non-ambiguous arg starters
+    if not State.newline_before?(state) and starts_no_paren_arg_strict?(state) do
       {state, args} = parse_no_paren_args(state, [])
       ast = Ast.call(token.value, meta, args)
       # No-paren calls can have trailing do blocks (like `schema "users" do`)
@@ -610,6 +622,25 @@ defmodule Hurricane.Parser.Expression do
     else
       # Plain variable
       ast = Ast.var(token.value, meta)
+      {state, ast}
+    end
+  end
+
+  # Op identifier: foo +b - identifier followed by operator-as-prefix
+  # The tokenizer gives us :op_identifier when there's space before op but not after
+  # This is definitively a no-parens call with first arg being a unary expression
+  defp parse_op_identifier(state, allow_do) do
+    token = State.current(state)
+    {state, _} = State.advance(state)
+    meta = Ast.token_meta(token)
+
+    # Parse args - the first one will start with a prefix operator
+    {state, args} = parse_no_paren_args(state, [])
+    ast = Ast.call(token.value, meta, args)
+
+    if allow_do do
+      maybe_parse_do_block(state, ast, meta)
+    else
       {state, ast}
     end
   end
@@ -672,10 +703,11 @@ defmodule Hurricane.Parser.Expression do
     {state, ast}
   end
 
-  # Check if current token can start a no-parens function argument
-  # :lbracket IS included because `foo [1, 2]` (with space) is a call with list arg
-  # The tokenizer distinguishes: foo[x] -> :bracket_identifier, foo [x] -> :identifier
-  defp starts_no_paren_arg?(state) do
+  # Check if current token can start a no-parens function argument (STRICT version)
+  # This version EXCLUDES + and - because those are ambiguous with infix operators
+  # The tokenizer handles the disambiguation via :op_identifier for "foo +b" patterns
+  # Use this for plain :identifier tokens where we need to distinguish "a + b" from "a b"
+  defp starts_no_paren_arg_strict?(state) do
     State.at_any?(state, [
       :string,
       :integer,
@@ -683,6 +715,10 @@ defmodule Hurricane.Parser.Expression do
       :atom,
       :alias,
       :identifier,
+      :paren_identifier,
+      :do_identifier,
+      :bracket_identifier,
+      :op_identifier,
       :charlist,
       :heredoc,
       :sigil,
@@ -700,8 +736,8 @@ defmodule Hurricane.Parser.Expression do
       :not,
       :&,
       :^,
-      :-,
-      :+,
+      # NOTE: :+ and :- are NOT here - they're ambiguous with infix
+      # The tokenizer tells us via :op_identifier when they should be prefix
       :!,
       :~~~
     ])
@@ -1786,25 +1822,28 @@ defmodule Hurricane.Parser.Expression do
   end
 
   defp parse_stab_body_exprs(state, acc) do
-    # Stop at clause/block terminators or definition keywords (for recovery)
+    # Stop at clause/block terminators, definition keywords (for recovery), or stab arrow
+    # Note: We also stop at :-> because if we hit an arrow, the previous "expression"
+    # was actually a pattern for a new stab clause, not part of this body
     if State.at?(state, :end) or State.at?(state, :else) or
          State.at?(state, :rescue) or State.at?(state, :catch) or
          State.at?(state, :after) or State.at_end?(state) or
+         State.at?(state, :->) or
          State.at?(state, :def) or State.at?(state, :defp) or
          State.at?(state, :defmacro) or State.at?(state, :defmacrop) or
          State.at?(state, :defmodule) do
       {state, acc}
     else
-      state = State.advance_push(state)
-      {state, expr} = parse_expression(state, 0)
-      state = State.advance_pop!(state)
-
-      acc = if expr, do: [expr | acc], else: acc
-
-      # Check for new stab clause AFTER parsing, not before
+      # Check for new stab clause BEFORE parsing the expression
+      # If we see what looks like a new clause (pattern -> ...), stop here
       if looks_like_new_stab_clause?(state) do
         {state, acc}
       else
+        state = State.advance_push(state)
+        {state, expr} = parse_expression(state, 0)
+        state = State.advance_pop!(state)
+
+        acc = if expr, do: [expr | acc], else: acc
         parse_stab_body_exprs(state, acc)
       end
     end
@@ -1898,9 +1937,8 @@ defmodule Hurricane.Parser.Expression do
       %{kind: :rparen} ->
         peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
 
-      # Comma at top level suggests end of simple expression - stop
-      %{kind: :comma} when bracket_depth == 0 ->
-        false
+      # Note: We allow comma at top level because catch clauses use :kind, pattern -> body
+      # The arrow line check prevents false positives from distant commas
 
       # Keywords that have their own stab clauses - stop searching
       # The -> inside these belongs to their inner clauses, not outer pattern

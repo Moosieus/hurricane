@@ -323,6 +323,12 @@ defmodule Hurricane.Parser.Structure do
         {state, _} = State.advance(state)
         {state, Ast.var(token.value, Ast.token_meta(token))}
 
+      # Do identifier: def foo do - identifier immediately followed by do (zero-arg function)
+      State.at?(state, :do_identifier) ->
+        token = State.current(state)
+        {state, _} = State.advance(state)
+        {state, Ast.var(token.value, Ast.token_meta(token))}
+
       true ->
         state = State.add_error(state, "expected function name")
         {state, Ast.error(State.current_meta(state))}

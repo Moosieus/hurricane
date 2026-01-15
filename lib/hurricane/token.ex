@@ -101,6 +101,7 @@ defmodule Hurricane.Token do
       :arrow_op -> value
       :dual_op -> value
       :mult_op -> value
+      :power_op -> value
       :two_op -> value
       :comp_op -> value
       :rel_op -> value
