@@ -262,6 +262,35 @@ world
       assert match?({:ok, _}, result) or match?({:ok, _, _}, result),
              "Parser crashed on fn inside case"
     end
+
+    test "recovers at custom definition macros like defn" do
+      # Pattern-based recovery should recognize defn as a definition boundary
+      # even though it's not a built-in keyword like def
+      code = """
+      defmodule Foo do
+        def broken(
+
+        defn working(x) do
+          x
+        end
+      end
+      """
+
+      result = Hurricane.parse(code)
+      assert match?({:ok, _, _}, result), "Parser should return with errors"
+      {:ok, ast, errors} = result
+
+      # Should have errors for the broken def
+      assert length(errors) > 0
+
+      # The working defn should still be parsed
+      # Check that defn call exists in the AST
+      assert ast_contains?(ast, fn
+               {:defn, _, [{:working, _, _} | _]} -> true
+               _ -> false
+             end),
+             "defn working should be parsed despite earlier broken def"
+    end
   end
 
   describe "compile-time constructs" do
@@ -329,5 +358,19 @@ world
       other ->
         other
     end)
+  end
+
+  # Helper to check if AST contains a node matching the predicate
+  defp ast_contains?(ast, pred) do
+    {_, found} =
+      Macro.prewalk(ast, false, fn node, acc ->
+        if acc or pred.(node) do
+          {node, true}
+        else
+          {node, acc}
+        end
+      end)
+
+    found
   end
 end

@@ -225,50 +225,48 @@ defmodule Hurricane.Token do
   end
 
   # Normalize identifier to check for keywords
+  #
+  # Philosophy: Elixir is implemented in terms of itself. Most "keywords" are just
+  # macros following normal call syntax. Only a handful need special token kinds:
+  #
+  # 1. Stab clause forms - their do blocks contain `pattern -> body` clauses
+  # 2. Generator forms - have special `<-` syntax
+  # 3. Try - has rescue/catch/else/after block sections
+  # 4. Metaprogramming - quote/unquote need special handling
+  # 5. Block structure - do/end/rescue/catch/else/after/when
+  # 6. Operators that look like identifiers - and/or/not/in
+  #
+  # Everything else (if, unless, raise, import, use, def, defmodule...) is just
+  # a regular call and needs no special token kind.
   defp normalize_identifier(value) when is_atom(value) do
     case value do
-      :def -> :def
-      :defp -> :defp
-      :defmacro -> :defmacro
-      :defmacrop -> :defmacrop
-      :defmodule -> :defmodule
-      :defstruct -> :defstruct
-      :defprotocol -> :defprotocol
-      :defimpl -> :defimpl
-      :defdelegate -> :defdelegate
-      :defguard -> :defguard
-      :defguardp -> :defguardp
-      :defexception -> :defexception
-      :defoverridable -> :defoverridable
+      # Stab clause forms - do block contains pattern -> body
       :case -> :case
       :cond -> :cond
-      :if -> :if
-      :unless -> :unless
+      :receive -> :receive
+      # Generator forms - special <- syntax
       :with -> :with
       :for -> :for
+      # Try - has block sections
       :try -> :try
-      :receive -> :receive
-      :raise -> :raise
-      :reraise -> :reraise
-      :throw -> :throw
+      # Metaprogramming
       :quote -> :quote
       :unquote -> :unquote
       :unquote_splicing -> :unquote_splicing
-      :import -> :import
-      :alias -> :alias_directive
-      :require -> :require
-      :use -> :use
-      :when -> :when
-      :and -> :and
-      :or -> :or
-      :not -> :not
-      :in -> :in
+      # Block structure keywords
+      :do -> :do
+      :end -> :end
       :rescue -> :rescue
       :catch -> :catch
       :else -> :else
       :after -> :after
-      :do -> :do
-      :end -> :end
+      :when -> :when
+      # Operators that look like identifiers
+      :and -> :and
+      :or -> :or
+      :not -> :not
+      :in -> :in
+      # Everything else is just an identifier (including if, unless, def, import, etc.)
       _ -> :identifier
     end
   end

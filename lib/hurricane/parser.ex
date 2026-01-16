@@ -137,6 +137,10 @@ defmodule Hurricane.Parser do
   @call_bp 60
   @access_bp 60
 
+  ## DEFINITION KEYWORD DETECTION
+  # These keywords are NOT given special token kinds - they come through as
+  # :identifier, :paren_identifier, or :do_identifier. We dispatch by value.
+  # This aligns with Elixir's parser which treats def, defmodule, etc. as regular calls.
   ## PUBLIC API
 
   @doc """
@@ -228,36 +232,10 @@ defmodule Hurricane.Parser do
   end
 
   defp parse_top_level_item(state) do
-    # Check if next token is ( - if so, this is desugared call syntax like defmodule(...)
-    # which should be parsed as a regular expression, not special form
-    next = State.peek(state)
-    is_paren_call = next && next.kind == :lparen
-
+    # All definition forms (def, defmodule, defn, defmemo, etc.) are handled uniformly
+    # through expression parsing. No keyword enumeration needed - pattern-based recovery
+    # in parse_call_args_rest handles definition boundaries.
     cond do
-      State.at?(state, :defmodule) and not is_paren_call ->
-        parse_defmodule(state)
-
-      State.at?(state, :def) and not is_paren_call ->
-        parse_def(state, :def)
-
-      State.at?(state, :defp) and not is_paren_call ->
-        parse_def(state, :defp)
-
-      State.at?(state, :defmacro) and not is_paren_call ->
-        parse_def(state, :defmacro)
-
-      State.at?(state, :defmacrop) and not is_paren_call ->
-        parse_def(state, :defmacrop)
-
-      State.at?(state, :defguard) and not is_paren_call ->
-        parse_def(state, :defguard)
-
-      State.at?(state, :defguardp) and not is_paren_call ->
-        parse_def(state, :defguardp)
-
-      State.at?(state, :defdelegate) and not is_paren_call ->
-        parse_defdelegate(state)
-
       # Stray :end tokens from incomplete structures - skip with error
       State.at?(state, :end) ->
         state = State.add_error(state, "unexpected end")
@@ -284,424 +262,9 @@ defmodule Hurricane.Parser do
         {state, _} = State.advance(state)
         {state, nil}
 
-      # Any other token: try to parse as expression
+      # Parse as expression - handles ALL definition forms uniformly
       true ->
         parse_expression(state)
-    end
-  end
-
-  ## MODULE DEFINITION
-
-  defp parse_defmodule(state) do
-    {state, defmodule_token} = State.expect(state, :defmodule)
-    meta = Ast.token_meta(defmodule_token)
-
-    # Parse module alias
-    {state, alias_ast} = parse_module_alias(state)
-
-    # Parse do block
-    {state, body, do_token, end_token} = parse_do_block(state, &parse_module_body/1)
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    ast = Ast.defmodule(alias_ast, body, meta)
-
-    {state, ast}
-  end
-
-  defp parse_module_alias(state) do
-    if State.at?(state, :alias) do
-      token = State.current(state)
-      {state, _} = State.advance(state)
-      meta = Ast.token_meta(token)
-
-      # Parse dotted aliases: Foo.Bar.Baz
-      {state, segments, last_token} = parse_module_alias_segments(state, [token.value], token)
-
-      ast = Ast.alias_node(segments, meta, last_token)
-      {state, ast}
-    else
-      # Error: expected module name
-      state = State.add_error(state, "expected module name")
-      {state, Ast.error(State.current_meta(state))}
-    end
-  end
-
-  defp parse_module_alias_segments(state, acc, last_token) do
-    if State.at?(state, :dot) do
-      # Peek ahead to see if next is an alias
-      next = State.peek(state)
-
-      if next && next.kind == :alias do
-        {state, _dot} = State.advance(state)
-        {state, alias_token} = State.advance(state)
-        parse_module_alias_segments(state, acc ++ [alias_token.value], alias_token)
-      else
-        {state, acc, last_token}
-      end
-    else
-      {state, acc, last_token}
-    end
-  end
-
-  ## MODULE BODY
-
-  defp parse_module_body(state) do
-    {state, items} = parse_module_body_items(state, [])
-    # Empty module bodies must be {:__block__, [], []} not nil
-    ast =
-      case Enum.reverse(items) do
-        [] -> {:__block__, [], []}
-        exprs -> Ast.block(exprs, [])
-      end
-
-    {state, ast}
-  end
-
-  defp parse_module_body_items(state, acc) do
-    # Skip any semicolons (expression separators)
-    state = skip_semicolons(state)
-
-    cond do
-      State.at?(state, :end) or State.at_end?(state) ->
-        {state, acc}
-
-      Recovery.at_recovery?(state, Recovery.block_body()) ->
-        {state, acc}
-
-      true ->
-        state = State.advance_push(state)
-        {state, item} = parse_module_body_item(state)
-        state = State.advance_pop!(state)
-
-        # Add end_of_expression metadata if followed by newline
-        item = add_end_of_expression(state, item)
-
-        acc = if item, do: [item | acc], else: acc
-        parse_module_body_items(state, acc)
-    end
-  end
-
-  defp parse_module_body_item(state) do
-    # Check if next token is ( - if so, this is desugared call syntax
-    next = State.peek(state)
-    is_paren_call = next && next.kind == :lparen
-
-    cond do
-      State.at?(state, :def) and not is_paren_call -> parse_def(state, :def)
-      State.at?(state, :defp) and not is_paren_call -> parse_def(state, :defp)
-      State.at?(state, :defmacro) and not is_paren_call -> parse_def(state, :defmacro)
-      State.at?(state, :defmacrop) and not is_paren_call -> parse_def(state, :defmacrop)
-      State.at?(state, :defguard) and not is_paren_call -> parse_def(state, :defguard)
-      State.at?(state, :defguardp) and not is_paren_call -> parse_def(state, :defguardp)
-      State.at?(state, :defdelegate) and not is_paren_call -> parse_defdelegate(state)
-      State.at?(state, :defmodule) and not is_paren_call -> parse_defmodule(state)
-      # @ goes through parse_expression for proper infix handling (e.g., @foo + 1)
-      State.at?(state, :use) and not is_paren_call -> parse_directive(state, :use)
-      State.at?(state, :import) and not is_paren_call -> parse_directive(state, :import)
-      State.at?(state, :alias_directive) and not is_paren_call -> parse_directive(state, :alias)
-      State.at?(state, :require) and not is_paren_call -> parse_directive(state, :require)
-      # Module attributes: @doc, @moduledoc, @spec, @type, etc.
-      # Parse as expression (@ is a prefix operator) - must come before recovery check
-      State.at?(state, :@) -> parse_expression(state)
-      Recovery.at_recovery?(state, Recovery.module_body()) -> {state, nil}
-      # Any other token: try to parse as expression
-      true -> parse_expression(state)
-    end
-  end
-
-  ## FUNCTION DEFINITION
-
-  defp parse_def(state, kind) do
-    {state, def_token} = State.advance(state)
-    meta = Ast.token_meta(def_token)
-
-    # Parse function name
-    {state, name_ast} = parse_function_name(state)
-
-    # Parse parameters if present
-    {state, call_ast} =
-      if State.at?(state, :lparen) do
-        {state, _lparen} = State.advance(state)
-        {state, params} = parse_def_params(state)
-        {state, closing_token} = State.expect(state, :rparen)
-
-        call_meta = name_ast_meta(name_ast)
-
-        call_meta =
-          if closing_token, do: Ast.with_closing(call_meta, closing_token), else: call_meta
-
-        case name_ast do
-          {name, _meta, nil} when is_atom(name) ->
-            {state, Ast.call(name, call_meta, params)}
-
-          _ ->
-            {state, name_ast}
-        end
-      else
-        {state, name_ast}
-      end
-
-    # Parse guard if present
-    {state, call_ast} =
-      if State.at?(state, :when) do
-        {state, when_token} = State.advance(state)
-        {state, guard} = parse_guard_expression(state)
-        when_meta = Ast.token_meta(when_token)
-        guarded = Ast.binary_op(:when, when_meta, call_ast, guard)
-        {state, guarded}
-      else
-        {state, call_ast}
-      end
-
-    # defguard/defguardp have no body - just the when clause
-    if kind in [:defguard, :defguardp] do
-      ast = {kind, meta, [call_ast]}
-      {state, ast}
-    else
-      # Parse body (do block or comma do:)
-      cond do
-        State.at?(state, :do) ->
-          {state, body, do_token, end_token} = parse_do_block(state, &parse_block_body/1)
-          meta = Ast.with_do_end(meta, do_token, end_token)
-          ast = Ast.def_node(kind, call_ast, body, meta)
-          {state, ast}
-
-        State.at?(state, :comma) ->
-          {state, _comma} = State.advance(state)
-          {state, body, do_token, end_token} = parse_keyword_do(state)
-          meta = Ast.with_do_end(meta, do_token, end_token)
-          ast = Ast.def_node(kind, call_ast, body, meta)
-          {state, ast}
-
-        true ->
-          # No body - this is a function head (e.g., declaring default args)
-          # Just return {kind, meta, [call_ast]} without body
-          ast = {kind, meta, [call_ast]}
-          {state, ast}
-      end
-    end
-  end
-
-  # defdelegate name(args), to: Module, as: :name
-  defp parse_defdelegate(state) do
-    {state, delegate_token} = State.advance(state)
-    meta = Ast.token_meta(delegate_token)
-
-    # Parse the call (function name with params)
-    {state, call_ast} = parse_expression(state, 0)
-
-    # Parse comma and keyword options
-    {state, opts} =
-      if State.at?(state, :comma) do
-        {state, _} = State.advance(state)
-        {state, kw_pairs} = parse_defdelegate_opts(state)
-        {state, kw_pairs}
-      else
-        {state, []}
-      end
-
-    ast = {:defdelegate, meta, [call_ast, opts]}
-    {state, ast}
-  end
-
-  # Parse keyword pairs (to:, as:)
-  defp parse_defdelegate_opts(state) do
-    if State.at?(state, :kw_identifier) do
-      token = State.current(state)
-      {state, _} = State.advance(state)
-      {state, value} = parse_expression(state, 0)
-
-      case State.eat(state, :comma) do
-        {:ok, state, _} ->
-          if State.at?(state, :kw_identifier) do
-            {state, rest} = parse_defdelegate_opts(state)
-            {state, [{token.value, value} | rest]}
-          else
-            {state, [{token.value, value}]}
-          end
-
-        {:error, state} ->
-          {state, [{token.value, value}]}
-      end
-    else
-      {state, []}
-    end
-  end
-
-  defp parse_function_name(state) do
-    cond do
-      # Plain identifier: def foo, def foo()
-      State.at?(state, :identifier) ->
-        token = State.current(state)
-        {state, _} = State.advance(state)
-        {state, Ast.var(token.value, Ast.token_meta(token))}
-
-      # Paren identifier: def foo() - identifier immediately followed by (
-      State.at?(state, :paren_identifier) ->
-        token = State.current(state)
-        {state, _} = State.advance(state)
-        {state, Ast.var(token.value, Ast.token_meta(token))}
-
-      # Do identifier: def foo do - identifier followed by do (zero-arg function)
-      State.at?(state, :do_identifier) ->
-        token = State.current(state)
-        {state, _} = State.advance(state)
-        {state, Ast.var(token.value, Ast.token_meta(token))}
-
-      true ->
-        state = State.add_error(state, "expected function name")
-        {state, Ast.error(State.current_meta(state))}
-    end
-  end
-
-  defp name_ast_meta({_name, meta, _args}) do
-    meta
-  end
-
-  ## DEFINITION PARAMETERS
-
-  defp parse_def_params(state) do
-    if State.at?(state, :rparen) or Recovery.at_recovery?(state, Recovery.params()) do
-      {state, []}
-    else
-      {state, param} = parse_def_param(state)
-      {state, rest} = parse_def_params_rest(state)
-      {state, [param | rest]}
-    end
-  end
-
-  defp parse_def_params_rest(state) do
-    case State.eat(state, :comma) do
-      {:ok, state, _} ->
-        if Recovery.at_recovery?(state, Recovery.params()) do
-          {state, []}
-        else
-          {state, param} = parse_def_param(state)
-          {state, rest} = parse_def_params_rest(state)
-          {state, [param | rest]}
-        end
-
-      {:error, state} ->
-        {state, []}
-    end
-  end
-
-  defp parse_def_param(state) do
-    # Parameters can be any pattern - use expression parser
-    if Recovery.at_recovery?(state, Recovery.params()) do
-      {state, Ast.error(State.current_meta(state))}
-    else
-      parse_expression(state)
-    end
-  end
-
-  ## GUARDS
-
-  defp parse_guard_expression(state) do
-    parse_expression(state)
-  end
-
-  ## DO BLOCKS
-
-  defp parse_do_block(state, body_parser) do
-    {state, do_token} = State.expect(state, :do)
-
-    {state, body} = body_parser.(state)
-
-    {state, end_token} = State.expect(state, :end)
-
-    {state, Ast.do_block(body), do_token, end_token}
-  end
-
-  defp parse_keyword_do(state) do
-    # Expect keyword form: `do:`
-    if State.at?(state, :kw_identifier) do
-      token = State.current(state)
-
-      if token.value == :do do
-        {state, _do_token} = State.advance(state)
-        # Parse expression after do:
-        {state, body} = parse_expression(state)
-        # Don't include do: in metadata for keyword style - Elixir doesn't
-        {state, Ast.do_block(body), nil, nil}
-      else
-        state = State.add_error(state, "expected 'do:'")
-        {state, Ast.do_block(nil), nil, nil}
-      end
-    else
-      state = State.add_error(state, "expected 'do:'")
-      {state, Ast.do_block(nil), nil, nil}
-    end
-  end
-
-  ## BLOCK BODY
-
-  defp parse_block_body(state) do
-    {state, exprs} = parse_block_body_items(state, [])
-    ast = Ast.block(Enum.reverse(exprs), [])
-    {state, ast}
-  end
-
-  defp parse_block_body_items(state, acc) do
-    cond do
-      State.at?(state, :end) or State.at_end?(state) ->
-        {state, acc}
-
-      # Use function_body recovery which includes :def for incomplete body recovery
-      Recovery.at_recovery?(state, Recovery.function_body()) ->
-        {state, acc}
-
-      true ->
-        state = State.advance_push(state)
-        {state, expr} = parse_block_body_item(state)
-        state = State.advance_pop!(state)
-
-        acc = if expr != nil, do: [expr | acc], else: acc
-        parse_block_body_items(state, acc)
-    end
-  end
-
-  defp parse_block_body_item(state) do
-    parse_expression(state)
-  end
-
-  ## DIRECTIVES (use, import, alias, require)
-
-  defp parse_directive(state, kind) do
-    {state, directive_token} = State.advance(state)
-    meta = Ast.token_meta(directive_token)
-
-    # Use expression parser to handle both simple aliases (Foo.Bar)
-    # and multi-alias syntax (Foo.{A, B, C})
-    {state, alias_ast} = parse_expression(state, 0)
-
-    # Parse options if present (comma followed by keyword list or expressions)
-    {state, args} =
-      if State.at?(state, :comma) do
-        {state, _comma} = State.advance(state)
-        {state, opts} = parse_directive_options(state, [])
-        {state, [alias_ast | opts]}
-      else
-        {state, [alias_ast]}
-      end
-
-    ast = Ast.call(kind, meta, args)
-    {state, ast}
-  end
-
-  defp parse_directive_options(state, acc) do
-    # Stop at module body tokens or end of expression
-    if State.at_any?(state, Recovery.module_body()) or State.at_end?(state) do
-      {state, Enum.reverse(acc)}
-    else
-      {state, expr} = parse_expression(state, 0)
-
-      if State.at?(state, :comma) do
-        {state, _comma} = State.advance(state)
-        parse_directive_options(state, [expr | acc])
-      else
-        {state, Enum.reverse([expr | acc])}
-      end
     end
   end
 
@@ -798,11 +361,9 @@ defmodule Hurricane.Parser do
       State.at?(state, :cond) ->
         parse_cond(state)
 
-      State.at?(state, :if) ->
-        parse_if(state)
-
-      State.at?(state, :unless) ->
-        parse_unless(state)
+      # Note: if/unless are just macros - no special token kind needed.
+      # They come through as identifier/paren_identifier/do_identifier
+      # and are handled by the general call parsing paths.
 
       State.at?(state, :with) ->
         parse_with(state)
@@ -845,59 +406,21 @@ defmodule Hurricane.Parser do
       State.at?(state, :op_identifier) ->
         parse_op_identifier(state, allow_do)
 
-      # Special keywords that work like function calls
-      State.at?(state, :raise) ->
-        parse_keyword_call(state, :raise)
-
-      State.at?(state, :reraise) ->
-        parse_keyword_call(state, :reraise)
-
-      State.at?(state, :throw) ->
-        parse_keyword_call(state, :throw)
-
+      # Metaprogramming - these still need special token kinds
       State.at?(state, :unquote) ->
         parse_keyword_call(state, :unquote)
 
       State.at?(state, :unquote_splicing) ->
         parse_keyword_call(state, :unquote_splicing)
 
-      # Directives (use, import, require, alias) can appear as expressions
-      State.at?(state, :use) ->
-        parse_keyword_call(state, :use)
-
-      State.at?(state, :import) ->
-        parse_keyword_call(state, :import)
-
-      State.at?(state, :require) ->
-        parse_keyword_call(state, :require)
-
-      State.at?(state, :alias_directive) ->
-        parse_keyword_call(state, :alias)
-
-      # Definition keywords can appear as calls in desugared syntax: defmodule(...)
-      State.at?(state, :defmodule) ->
-        parse_keyword_call(state, :defmodule)
-
-      State.at?(state, :def) ->
-        parse_keyword_call(state, :def)
-
-      State.at?(state, :defp) ->
-        parse_keyword_call(state, :defp)
-
-      State.at?(state, :defmacro) ->
-        parse_keyword_call(state, :defmacro)
-
-      State.at?(state, :defmacrop) ->
-        parse_keyword_call(state, :defmacrop)
-
-      State.at?(state, :defdelegate) ->
-        parse_keyword_call(state, :defdelegate)
-
-      State.at?(state, :defguard) ->
-        parse_keyword_call(state, :defguard)
-
-      State.at?(state, :defguardp) ->
-        parse_keyword_call(state, :defguardp)
+      # Note: raise/reraise/throw/import/use/require/alias are just calls.
+      # They come through as identifier/paren_identifier/do_identifier
+      # and are handled by the general call parsing paths.
+      #
+      # def* keywords are also NOT special-cased here anymore.
+      # They come through as :identifier/:paren_identifier/:do_identifier
+      # and are handled by the general identifier parsing paths.
+      # Desugared syntax like defmodule(...) is parsed as a normal call.
 
       # Module aliases
       State.at?(state, :alias) ->
@@ -1308,7 +831,7 @@ defmodule Hurricane.Parser do
   # The tokenizer gives us :identifier when there's symmetric spacing around operators
   # (e.g., "a + b" has space before AND after +, so a is :identifier)
   # For asymmetric spacing ("foo +b"), the tokenizer gives us :op_identifier instead
-  defp parse_identifier_or_call(state, allow_do) do
+  defp parse_identifier_or_call(state, _allow_do) do
     token = State.current(state)
     {state, _} = State.advance(state)
     meta = Ast.token_meta(token)
@@ -1320,13 +843,10 @@ defmodule Hurricane.Parser do
     if not State.newline_before?(state) and starts_no_paren_arg_strict?(state) do
       {state, args} = parse_no_paren_args(state, [])
       ast = Ast.call(token.value, meta, args)
-      # No-paren calls can have trailing do blocks (like `schema "users" do`)
-      # But only if allow_do is true
-      if allow_do do
-        maybe_parse_do_block(state, ast, meta)
-      else
-        {state, ast}
-      end
+      # No-paren calls WITH args always own their do block (e.g., `if true do...end`)
+      # The allow_do flag is only for zero-arg calls (handled in parse_do_identifier)
+      # where we need to distinguish `foo do...end` from `case foo do...end`
+      maybe_parse_do_block(state, ast, meta)
     else
       # Plain variable
       ast = Ast.var(token.value, meta)
@@ -1337,7 +857,7 @@ defmodule Hurricane.Parser do
   # Op identifier: foo +b - identifier followed by operator-as-prefix
   # The tokenizer gives us :op_identifier when there's space before op but not after
   # This is definitively a no-parens call with first arg being a unary expression
-  defp parse_op_identifier(state, allow_do) do
+  defp parse_op_identifier(state, _allow_do) do
     token = State.current(state)
     {state, _} = State.advance(state)
     meta = Ast.token_meta(token)
@@ -1346,11 +866,8 @@ defmodule Hurricane.Parser do
     {state, args} = parse_no_paren_args(state, [])
     ast = Ast.call(token.value, meta, args)
 
-    if allow_do do
-      maybe_parse_do_block(state, ast, meta)
-    else
-      {state, ast}
-    end
+    # Calls with args always own their do block
+    maybe_parse_do_block(state, ast, meta)
   end
 
   # Paren identifier: foo( - identifier immediately followed by (
@@ -2633,14 +2150,15 @@ defmodule Hurricane.Parser do
         := ->
           false
 
-        # Hit a definition keyword - definitely not a pattern
-        k when k in [:def, :defp, :defmacro, :defmacrop, :defmodule] ->
-          false
-
-        # Continue scanning
+        # Continue scanning (check for definition pattern first)
         _ ->
-          {state, _} = State.advance(state)
-          scan_for_arrow(state, depth + 1)
+          if Recovery.looks_like_definition?(state) do
+            # Hit a definition pattern - definitely not a pattern
+            false
+          else
+            {state, _} = State.advance(state)
+            scan_for_arrow(state, depth + 1)
+          end
       end
     end
   end
@@ -2804,18 +2322,31 @@ defmodule Hurricane.Parser do
     case State.eat(state, :comma) do
       {:ok, state, _} ->
         # Comma consumed, now parse next arg
-        if State.at?(state, :rparen) do
-          # Trailing comma - add error for strict conformance
-          # Format matches Elixir: message and token as separate parts
-          state = State.add_error(state, {"syntax error before: ", "')'"})
-          {state, []}
-        else
-          state = State.advance_push(state)
-          {state, arg} = parse_call_arg(state)
-          state = State.advance_pop!(state)
-          {state, rest} = parse_call_args_rest(state)
-          args = if arg, do: [arg | rest], else: rest
-          {state, args}
+        cond do
+          State.at?(state, :rparen) ->
+            # Trailing comma - add error for strict conformance
+            # Format matches Elixir: message and token as separate parts
+            state = State.add_error(state, {"syntax error before: ", "')'"})
+            {state, []}
+
+          # Double comma (,,) - skip with error and continue
+          State.at?(state, :comma) ->
+            state = State.add_error(state, "unexpected comma")
+            parse_call_args_rest(state)
+
+          # Definition boundary recovery - stop at definition patterns after newline
+          # This handles cases like: foo(x,\ndef bar - should recover at def
+          State.newline_before?(state) and Recovery.looks_like_definition?(state) ->
+            state = State.add_error(state, "expected :rparen, got definition")
+            {state, []}
+
+          true ->
+            state = State.advance_push(state)
+            {state, arg} = parse_call_arg(state)
+            state = State.advance_pop!(state)
+            {state, rest} = parse_call_args_rest(state)
+            args = if arg, do: [arg | rest], else: rest
+            {state, args}
         end
 
       {:error, state} ->
@@ -2904,88 +2435,8 @@ defmodule Hurricane.Parser do
     {state, ast}
   end
 
-  # if expr do body else else_body end
-  defp parse_if(state) do
-    {state, if_token} = State.advance(state)
-    meta = Ast.token_meta(if_token)
-
-    # Check for parenthesized form: if(cond, do: x, else: y)
-    if State.at?(state, :lparen) do
-      {state, _} = State.advance(state)
-      {state, condition} = parse_expression(state, 0)
-      {state, _} = State.expect(state, :comma)
-      {state, kw_pairs} = parse_keyword_pairs(state)
-      {state, closing} = State.expect(state, :rparen)
-      meta = if closing, do: Ast.with_closing(meta, closing), else: meta
-      ast = {:if, meta, [condition, kw_pairs]}
-      {state, ast}
-    else
-      # Parse condition - allow_do: false because do belongs to if
-      {state, condition} = parse_expression(state, 0, allow_do: false)
-
-      # Check for do block or keyword form
-      if State.at?(state, :do) do
-        {state, do_token} = State.advance(state)
-        {state, body} = parse_block_until(state, [:else, :end])
-
-        {state, else_body, end_token} =
-          if State.at?(state, :else) do
-            {state, _} = State.advance(state)
-            {state, else_body} = parse_block_until(state, [:end])
-            {state, end_token} = State.expect(state, :end)
-            {state, else_body, end_token}
-          else
-            {state, end_token} = State.expect(state, :end)
-            {state, nil, end_token}
-          end
-
-        meta = Ast.with_do_end(meta, do_token, end_token)
-        body_kw = if else_body, do: [do: body, else: else_body], else: [do: body]
-        ast = {:if, meta, [condition, body_kw]}
-        {state, ast}
-      else
-        # Keyword form: if cond, do: body, else: else_body
-        {state, _} = State.expect(state, :comma)
-        {state, kw_pairs} = parse_keyword_pairs(state)
-        ast = {:if, meta, [condition, kw_pairs]}
-        {state, ast}
-      end
-    end
-  end
-
-  defp parse_unless(state) do
-    {state, unless_token} = State.advance(state)
-    meta = Ast.token_meta(unless_token)
-
-    # allow_do: false because do belongs to unless
-    {state, condition} = parse_expression(state, 0, allow_do: false)
-
-    if State.at?(state, :do) do
-      {state, do_token} = State.advance(state)
-      {state, body} = parse_block_until(state, [:else, :end])
-
-      {state, else_body, end_token} =
-        if State.at?(state, :else) do
-          {state, _} = State.advance(state)
-          {state, else_body} = parse_block_until(state, [:end])
-          {state, end_token} = State.expect(state, :end)
-          {state, else_body, end_token}
-        else
-          {state, end_token} = State.expect(state, :end)
-          {state, nil, end_token}
-        end
-
-      meta = Ast.with_do_end(meta, do_token, end_token)
-      body_kw = if else_body, do: [do: body, else: else_body], else: [do: body]
-      ast = {:unless, meta, [condition, body_kw]}
-      {state, ast}
-    else
-      {state, _} = State.expect(state, :comma)
-      {state, kw_pairs} = parse_keyword_pairs(state)
-      ast = {:unless, meta, [condition, kw_pairs]}
-      {state, ast}
-    end
-  end
+  # Note: if/unless are just macros - no special parsing needed.
+  # They're handled by the general identifier/call parsing paths.
 
   # with clauses do body else else_clauses end
   defp parse_with(state) do
@@ -3237,13 +2688,11 @@ defmodule Hurricane.Parser do
   end
 
   defp parse_stab_clauses(state, acc) do
-    # Stop at block terminators, definition keywords (for recovery), or orphan delimiters
+    # Stop at block terminators, definition patterns (for recovery), or orphan delimiters
     if State.at?(state, :end) or State.at?(state, :else) or
          State.at?(state, :rescue) or State.at?(state, :catch) or
          State.at?(state, :after) or State.at_end?(state) or
-         State.at?(state, :def) or State.at?(state, :defp) or
-         State.at?(state, :defmacro) or State.at?(state, :defmacrop) or
-         State.at?(state, :defmodule) or
+         Recovery.looks_like_definition?(state) or
          State.at_any?(state, Recovery.closing_delimiters()) do
       {state, Enum.reverse(acc)}
     else
@@ -3311,8 +2760,7 @@ defmodule Hurricane.Parser do
          State.at?(state, :after) or State.at_end?(state) or
          State.at?(state, :->) or
          State.at_any?(state, Recovery.closing_delimiters()) or
-         (State.newline_before?(state) and
-            State.at_any?(state, [:def, :defp, :defmacro, :defmacrop, :defmodule])) do
+         (State.newline_before?(state) and Recovery.looks_like_definition?(state)) do
       {state, acc}
     else
       # Check for new stab clause BEFORE parsing the expression
@@ -3447,23 +2895,63 @@ defmodule Hurricane.Parser do
 
   defp parse_block_until(state, terminators) do
     {state, exprs} = parse_block_until_exprs(state, terminators, [])
-    ast = Ast.block(Enum.reverse(exprs), [])
+    # Empty do blocks require {:__block__, [], []} not nil
+    # This matches Elixir's behavior: `foo do end` produces [do: {:__block__, [], []}]
+    ast =
+      case Enum.reverse(exprs) do
+        [] ->
+          {:__block__, [], []}
+
+        # unquote_splicing must always be wrapped in a block because it can expand
+        # to multiple expressions at compile time
+        [{:unquote_splicing, _, _} = single] ->
+          {:__block__, [], [single]}
+
+        [single] ->
+          single
+
+        multiple ->
+          {:__block__, [], multiple}
+      end
+
     {state, ast}
   end
 
   defp parse_block_until_exprs(state, terminators, acc) do
-    if State.at_any?(state, terminators) or State.at_end?(state) do
-      {state, acc}
-    else
-      state = State.advance_push(state)
-      {state, expr} = parse_expression(state, 0)
-      state = State.advance_pop!(state)
+    cond do
+      State.at_any?(state, terminators) or State.at_end?(state) ->
+        {state, acc}
 
-      # Add end_of_expression metadata if followed by newline or terminator
-      expr = add_end_of_expression(state, expr)
+      # Orphan closing delimiters from Toxic's error recovery - skip with error
+      State.at_any?(state, Recovery.closing_delimiters()) ->
+        token = State.current(state)
+        state = State.add_error(state, "unexpected #{inspect(token.kind)}")
+        {state, _} = State.advance(state)
+        parse_block_until_exprs(state, terminators, acc)
 
-      acc = if expr != nil, do: [expr | acc], else: acc
-      parse_block_until_exprs(state, terminators, acc)
+      # Stray block keywords - skip with error
+      State.at_any?(state, [:do, :rescue, :catch, :else, :after]) ->
+        token = State.current(state)
+        state = State.add_error(state, "unexpected #{token.kind}")
+        {state, _} = State.advance(state)
+        parse_block_until_exprs(state, terminators, acc)
+
+      # Stray :-> - skip with error
+      State.at?(state, :->) ->
+        state = State.add_error(state, "unexpected ->")
+        {state, _} = State.advance(state)
+        parse_block_until_exprs(state, terminators, acc)
+
+      true ->
+        state = State.advance_push(state)
+        {state, expr} = parse_expression(state, 0)
+        state = State.advance_pop!(state)
+
+        # Add end_of_expression metadata if followed by newline or terminator
+        expr = add_end_of_expression(state, expr)
+
+        acc = if expr != nil, do: [expr | acc], else: acc
+        parse_block_until_exprs(state, terminators, acc)
     end
   end
 end
