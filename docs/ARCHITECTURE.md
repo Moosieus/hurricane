@@ -14,8 +14,9 @@ It produces standard Elixir AST and is designed for resilience over strictness.
 ┌─────────────────────────────────────────────────────────────┐
 │                           Lexer                              │
 │  ─────────────────────────────────────────────────────────  │
-│  • Hand-written or wraps :elixir_tokenizer                  │
-│  • Produces tokens with {line, column} spans                │
+│  • Uses Toxic error-tolerant lexer                          │
+│  • Tokens include start AND end positions (full ranges)     │
+│  • Continues past lexer errors (error tokens inline)        │
 │  • Handles string interpolation, sigils, heredocs           │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -67,18 +68,16 @@ It produces standard Elixir AST and is designed for resilience over strictness.
 
 ```
 lib/hurricane/
-├── hurricane.ex              # Public API
-├── lexer.ex                  # Tokenization
-├── token.ex                  # Token struct
-├── parser.ex                 # Main parser entry
-├── parser/
-│   ├── state.ex              # Parser state management
-│   ├── recovery.ex           # Recovery set definitions
-│   ├── structure.ex          # Recursive descent (top-level)
-│   ├── expression.ex         # Pratt expression parser
-│   ├── collection.ex         # List, tuple, map, binary
-│   └── special.ex            # case, cond, with, try, etc.
-└── ast.ex                    # AST construction helpers
+├── hurricane.ex              # Public API: parse/1, parse!/1
+├── lexer.ex                  # Tokenization (delegates to ToxicAdapter)
+├── lexer/
+│   └── toxic_adapter.ex      # Bridge to Toxic error-tolerant lexer
+├── token.ex                  # Token struct with full range info
+├── ast.ex                    # AST construction helpers
+├── parser.ex                 # Main parser (monolithic: structure + Pratt + special forms)
+└── parser/
+    ├── state.ex              # Parser state management + advance assertions
+    └── recovery.ex           # Recovery set definitions
 ```
 
 ## Parser State
@@ -137,35 +136,49 @@ end
 
 ## Recovery Sets
 
-Defined in `Hurricane.Parser.Recovery`:
+Defined in `Hurricane.Parser.Recovery`. Each set defines "sync tokens" - when the parser gets lost, it skips to the next token in the recovery set to continue parsing.
 
 ```elixir
 defmodule Hurricane.Parser.Recovery do
-  # Module body: what ends a module-level item?
-  @module_body [:def, :defp, :defmacro, :defmacrop, :defmodule,
-                :defstruct, :defprotocol, :defimpl, :defdelegate,
-                :@, :end, :eof]
+  # Shared token set for closing delimiters
+  @closing_delimiters [:rparen, :rbracket, :rbrace, :rangle]
+
+  # Module body: what indicates start of new item or end of module?
+  def module_body do
+    [:def, :defp, :defmacro, :defmacrop, :defmodule, :defstruct,
+     :defprotocol, :defimpl, :defdelegate, :defguard, :defguardp,
+     :defexception, :defoverridable, :@, :use, :import, :alias_directive,
+     :require, :end, :eof, :->]
+  end
 
   # Block body: what ends statements inside do/end?
-  @block_body [:end, :rescue, :catch, :else, :after, :eof]
+  def block_body do
+    [:end, :rescue, :catch, :else, :after, :-> | @closing_delimiters ++ [:eof]]
+  end
+
+  # Function body: includes definition keywords (abnormal termination)
+  def function_body do
+    [:end, :rescue, :catch, :else, :after, :->,
+     :def, :defp, :defmacro, :defmacrop, :defmodule | @closing_delimiters ++ [:eof]]
+  end
 
   # Parameters: what ends a parameter list?
-  @params [:rparen, :arrow, :do, :when, :def, :defp, :defmacro, :end, :eof]
+  def params do
+    [:rparen, :do, :when, :def, :defp, :defmacro, :defmacrop, :end, :eof, :->]
+  end
 
   # Stab clauses: what ends a clause in case/cond/fn?
-  @stab_clause [:arrow, :end, :else, :rescue, :catch, :after, :eof]
+  def stab_clause do
+    [:->, :end, :else, :rescue, :catch, :after, :eof]
+  end
 
   # Collections: what ends list/tuple/map contents?
-  @collection [:rbracket, :rbrace, :rparen, :rangle, :end, :eof]
+  def collection, do: @closing_delimiters ++ [:end, :eof]
 
-  def module_body, do: @module_body
-  def block_body, do: @block_body
-  def params, do: @params
-  def stab_clause, do: @stab_clause
-  def collection, do: @collection
-
-  def at_recovery?(state, set) do
-    current_kind(state) in set
+  # Expressions: what ends expression parsing?
+  def expression do
+    [:comma, :do, :end, :rescue, :catch, :else, :after, :->,
+     :def, :defp, :defmacro, :defmacrop, :defmodule | @closing_delimiters ++ [:eof]]
   end
 end
 ```

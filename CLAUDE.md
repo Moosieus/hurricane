@@ -28,28 +28,27 @@ Build a parser that:
 
 ## Constraints
 
-- **Pure Elixir** — No NIFs, no external dependencies
+- **Pure Elixir** — No NIFs
 - **AST format is fixed** — Must match Elixir's AST exactly for valid code
 - **Resilience over strictness** — Always return a tree, mark errors in-band
 
 ## Key Decisions
 
-### Lexer: Wrap `:elixir_tokenizer` (for now)
+### Lexer: Toxic (error-tolerant)
 
-Use Elixir's built-in tokenizer. It's stable (used by the formatter), handles all edge cases
-(sigils, heredocs, interpolation), and saves weeks of work.
+We use the Toxic lexer which provides:
+- **Error recovery**: Continues tokenizing after errors, emitting error tokens inline
+- **Ranged positions**: Both start AND end positions for every token
+- **IDE-ready**: Enables "cursor in token" queries for completion, hover, etc.
 
 ```elixir
-:elixir_tokenizer.tokenize(code, 1, [])
+# Via Hurricane.Lexer.ToxicAdapter
+stream = Toxic.new(source, 1, 1, error_mode: :tolerant)
+tokens = stream |> Toxic.to_stream() |> Enum.to_list() |> Toxic.Legacy.collapse_linear_ranges()
 ```
 
-If lexer-level error recovery becomes necessary later (incomplete strings mid-edit), we can
-fork Elixir's tokenizer like Spitfire did. Spitfire vendored `elixir_tokenizer.erl` (79KB of
-Erlang) with just the module name changed — see `../spitfire/src/spitfire_tokenizer.erl`.
-
-**Start with `:elixir_tokenizer`. Fork only if we hit lexer recovery issues.** No point
-carrying 79KB of Erlang unless we need to modify it. Most recovery happens at the parser
-level anyway.
+This replaced the original `:elixir_tokenizer` approach once lexer-level error recovery
+became necessary for incomplete strings/sigils mid-edit.
 
 ### AST Precision: Full Metadata
 
@@ -76,31 +75,38 @@ Both are available and should be used:
 
 ```
 lib/hurricane/
-├── hurricane.ex              # Public API: parse/1, parse/2
-├── lexer.ex                  # Tokenizer (or wrap :elixir_tokenizer)
-├── token.ex                  # Token struct
-├── parser.ex                 # Main parser entry
-├── parser/
-│   ├── state.ex              # Parser state + core operations
-│   ├── recovery.ex           # Recovery set definitions
-│   ├── structure.ex          # Recursive descent for top-level
-│   ├── expression.ex         # Pratt parser for expressions
-│   ├── collection.ex         # Lists, tuples, maps, binaries
-│   └── special.ex            # case, cond, with, try, fn, etc.
-└── ast.ex                    # AST construction helpers
+├── hurricane.ex              # Public API: parse/1, parse!/1
+├── lexer.ex                  # Tokenization (delegates to ToxicAdapter)
+├── lexer/
+│   └── toxic_adapter.ex      # Bridge to Toxic error-tolerant lexer
+├── token.ex                  # Token struct with full range info
+├── ast.ex                    # AST construction helpers
+├── parser.ex                 # Main parser (monolithic: structure + Pratt + special forms)
+└── parser/
+    ├── state.ex              # Parser state + advance assertions
+    └── recovery.ex           # Recovery set definitions
 ```
 
 ## Non-Negotiables
 
 ### 1. Recovery Sets
 
-Define in `recovery.ex`:
+Defined in `recovery.ex`. Each set defines "sync tokens" - when lost, skip to the next token in the recovery set:
 ```elixir
-@module_body [:def, :defp, :defmacro, :defmodule, :@, :end, :eof]
-@block_body [:end, :rescue, :catch, :else, :after, :eof]
-@params [:rparen, :arrow, :do, :when, :def, :defp, :end, :eof]
-@stab_clause [:arrow, :end, :else, :rescue, :catch, :after, :eof]
-@collection [:rbracket, :rbrace, :rparen, :rangle, :end, :eof]
+@closing_delimiters [:rparen, :rbracket, :rbrace, :rangle]
+
+def module_body do
+  [:def, :defp, :defmacro, :defmacrop, :defmodule, :defstruct, :defprotocol,
+   :defimpl, :defdelegate, :defguard, :defguardp, :defexception, :defoverridable,
+   :@, :use, :import, :alias_directive, :require, :end, :eof, :->]
+end
+
+def block_body, do: [:end, :rescue, :catch, :else, :after, :-> | @closing_delimiters ++ [:eof]]
+def function_body, do: [:end, :rescue, :catch, :else, :after, :->, :def, :defp, :defmacro, :defmacrop, :defmodule | @closing_delimiters ++ [:eof]]
+def params, do: [:rparen, :do, :when, :def, :defp, :defmacro, :defmacrop, :end, :eof, :->]
+def stab_clause, do: [:->, :end, :else, :rescue, :catch, :after, :eof]
+def collection, do: @closing_delimiters ++ [:end, :eof]
+def expression, do: [:comma, :do, :end, :rescue, :catch, :else, :after, :->, :def, :defp, :defmacro, :defmacrop, :defmodule | @closing_delimiters ++ [:eof]]
 ```
 
 Use at every loop boundary.

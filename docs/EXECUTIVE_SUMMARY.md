@@ -41,7 +41,7 @@ Source → Lexer → Tokens → Parser → Elixir AST
 
 | Component | Approach | Responsibility |
 |-----------|----------|----------------|
-| **Lexer** | Hand-written or wrap `:elixir_tokenizer` | Tokens with `{line, column}` spans |
+| **Lexer** | Toxic (error-tolerant) | Tokens with full ranges, continues past errors |
 | **Structure Parser** | Recursive descent | `defmodule`, `def`, `do/end`, `case`, etc. |
 | **Expression Parser** | Pratt (operator precedence) | Operators, precedence, associativity |
 | **Output** | Direct emission | Standard Elixir AST tuples |
