@@ -2625,6 +2625,10 @@ defmodule Hurricane.Parser do
         :eof ->
           false
 
+        # Hit :do - we're entering a block (case/if/etc), arrows inside are not fn clauses
+        :do ->
+          false
+
         # Hit assignment operator - this is body code, not a pattern
         := ->
           false
@@ -2763,24 +2767,23 @@ defmodule Hurricane.Parser do
   end
 
   defp parse_fn_body_exprs(state, acc) do
-    # Stop at end, semicolon (clause separator), arrow (new clause pattern), or eof
-    if State.at?(state, :end) or State.at?(state, :semicolon) or
-         State.at?(state, :->) or State.at_end?(state) do
-      {state, acc}
-    else
-      state = State.advance_push(state)
-      {state, expr} = parse_expression(state, 0)
-      state = State.advance_pop!(state)
-
-      acc = if expr != nil, do: [expr | acc], else: acc
-
-      # In fn bodies, newlines typically separate clauses, not expressions
-      # Only continue if we're on the same line or at explicit continuation
-      if State.newline_before?(state) and not State.at?(state, :semicolon) do
+    # Stop at end, semicolon (clause separator), or eof
+    # Also stop if there's a newline and the next tokens look like a new clause pattern
+    cond do
+      State.at?(state, :end) or State.at?(state, :semicolon) or State.at_end?(state) ->
         {state, acc}
-      else
+
+      # Newline before next token and it looks like a new clause - stop here
+      State.newline_before?(state) and looks_like_fn_clause?(state) ->
+        {state, acc}
+
+      true ->
+        state = State.advance_push(state)
+        {state, expr} = parse_expression(state, 0)
+        state = State.advance_pop!(state)
+
+        acc = if expr != nil, do: [expr | acc], else: acc
         parse_fn_body_exprs(state, acc)
-      end
     end
   end
 
