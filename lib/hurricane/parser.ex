@@ -271,7 +271,7 @@ defmodule Hurricane.Parser do
         {state, nil}
 
       # Orphan closing delimiters (from Toxic's error recovery) - skip with error
-      State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) ->
+      State.at_any?(state, Recovery.closing_delimiters()) ->
         token = State.current(state)
         state = State.add_error(state, "unexpected #{inspect(token.kind)}")
         {state, _} = State.advance(state)
@@ -2828,7 +2828,9 @@ defmodule Hurricane.Parser do
     if State.at?(state, :kw_identifier) do
       parse_keyword_args(state)
     else
-      parse_expression(state, 0)
+      # allow_do: false - do blocks belong to outer call, not inner expressions
+      # e.g., `defn softmax(t) do...end` -> defn(softmax(t), [do: ...])
+      parse_expression(state, 0, allow_do: false)
     end
   end
 
@@ -3242,7 +3244,7 @@ defmodule Hurricane.Parser do
          State.at?(state, :def) or State.at?(state, :defp) or
          State.at?(state, :defmacro) or State.at?(state, :defmacrop) or
          State.at?(state, :defmodule) or
-         State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) do
+         State.at_any?(state, Recovery.closing_delimiters()) do
       {state, Enum.reverse(acc)}
     else
       state = State.advance_push(state)
@@ -3308,7 +3310,7 @@ defmodule Hurricane.Parser do
          State.at?(state, :rescue) or State.at?(state, :catch) or
          State.at?(state, :after) or State.at_end?(state) or
          State.at?(state, :->) or
-         State.at_any?(state, [:rparen, :rbracket, :rbrace, :rangle]) or
+         State.at_any?(state, Recovery.closing_delimiters()) or
          (State.newline_before?(state) and
             State.at_any?(state, [:def, :defp, :defmacro, :defmacrop, :defmodule])) do
       {state, acc}

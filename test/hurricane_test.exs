@@ -297,6 +297,26 @@ world
       elixir_ast = strip_metadata(elixir_ast, [:end_of_expression])
       assert our_ast == elixir_ast
     end
+
+    test "parses defn (Nx numerical definitions)" do
+      # defn is a macro from Nx.Defn that works like def
+      # The do block should attach to defn, not the inner call
+      code = """
+      defmodule MyModule do
+        import Nx.Defn
+
+        defn softmax(t) do
+          Nx.exp(t) / Nx.sum(Nx.exp(t))
+        end
+      end
+      """
+
+      {:ok, our_ast} = Hurricane.parse(code)
+      {:ok, elixir_ast} = Code.string_to_quoted(code, columns: true, token_metadata: true)
+      our_ast = strip_metadata(our_ast, [:end_of_expression])
+      elixir_ast = strip_metadata(elixir_ast, [:end_of_expression])
+      assert our_ast == elixir_ast
+    end
   end
 
   # Helper to strip specific metadata keys from AST

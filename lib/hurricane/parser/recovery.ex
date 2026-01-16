@@ -21,6 +21,13 @@ defmodule Hurricane.Parser.Recovery do
 
   alias Hurricane.Parser.State
 
+  ## SHARED TOKEN SETS
+
+  @closing_delimiters [:rparen, :rbracket, :rbrace, :rangle]
+
+  @doc "Closing delimiter tokens (orphan closers that indicate recovery points)."
+  def closing_delimiters, do: @closing_delimiters
+
   ## RECOVERY SET DEFINITIONS
 
   @doc """
@@ -67,13 +74,8 @@ defmodule Hurricane.Parser.Recovery do
       :else,
       :after,
       # Stab arrow - indicates stray arrow from incomplete pattern
-      :->,
-      # Orphan closing delimiters - should not be consumed by expression parser
-      :rparen,
-      :rbracket,
-      :rbrace,
-      :rangle,
-      :eof
+      :->
+      | @closing_delimiters ++ [:eof]
     ]
   end
 
@@ -95,13 +97,8 @@ defmodule Hurricane.Parser.Recovery do
       :defp,
       :defmacro,
       :defmacrop,
-      :defmodule,
-      # Orphan closing delimiters - should not be consumed by expression parser
-      :rparen,
-      :rbracket,
-      :rbrace,
-      :rangle,
-      :eof
+      :defmodule
+      | @closing_delimiters ++ [:eof]
     ]
   end
 
@@ -145,14 +142,7 @@ defmodule Hurricane.Parser.Recovery do
   Tokens that indicate end of collection.
   """
   def collection do
-    [
-      :rbracket,
-      :rbrace,
-      :rparen,
-      :rangle,
-      :end,
-      :eof
-    ]
+    @closing_delimiters ++ [:end, :eof]
   end
 
   @doc """
@@ -162,10 +152,6 @@ defmodule Hurricane.Parser.Recovery do
   def expression do
     [
       :comma,
-      :rparen,
-      :rbracket,
-      :rbrace,
-      :rangle,
       :do,
       :end,
       :rescue,
@@ -178,8 +164,8 @@ defmodule Hurricane.Parser.Recovery do
       :defp,
       :defmacro,
       :defmacrop,
-      :defmodule,
-      :eof
+      :defmodule
+      | @closing_delimiters ++ [:eof]
     ]
   end
 
