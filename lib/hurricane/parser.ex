@@ -1,22 +1,37 @@
 defmodule Hurricane.Parser do
   @moduledoc """
-  Hybrid Pratt + recursive descent parser.
+  Hybrid Pratt + recursive descent parser for Elixir.
+
+  ## Philosophy: Structural Parsing
+
+  Like Elixir's actual parser (elixir_parser.yrl), we treat most "keywords" as
+  regular calls with do blocks. The parser handles general structural classes:
+
+  - **Block structure**: `do`/`end`/`rescue`/`catch`/`else`/`after`/`when`
+  - **Word operators**: `and`/`or`/`not`/`in`
+  - **Everything else**: Just identifiers with normal call syntax
+
+  This means `def`, `defmodule`, `case`, `if`, `Nx.defn`, and any custom macro
+  are all parsed uniformly. The parser detects stab clauses dynamically by
+  looking for `->` in do block contents, not by recognizing specific keywords.
 
   ## Entry Points
 
-  - `parse/1` - Parse source code, returns `{:ok, ast}` or `{:ok, ast, errors}`
-  - `parse!/1` - Parse source code, returns AST directly
+  - `parse/1` - Returns `{:ok, ast}` or `{:ok, ast, errors}`
+  - `parse!/1` - Returns AST directly
 
   ## How It Works
 
-  **Top-level:** loops over expressions, dispatching to specialized handlers
-  for `defmodule`, `def`, etc., or `parse_expression` for everything else.
+  **Top-level:** Loops over expressions. Special forms like `defmodule` are
+  dispatched by identifier value (not token kind) to handlers that understand
+  their specific syntax.
 
-  **Expression parsing (Pratt core):**
-  `parse_expression/2` -> `parse_prefix/2` -> `parse_infix_loop/3`
+  **Expression parsing (Pratt):**
+  `parse_expression/2` → `parse_prefix/2` → `parse_infix_loop/4`
 
-  Complex forms (`case`, `fn`, etc.) use recursive descent within `parse_prefix`,
-  returning complete AST nodes to the Pratt loop.
+  **Do block parsing:**
+  `parse_do_block_body/2` peeks ahead for `->` to determine if content is
+  stab clauses (for case/cond/fn) or regular expressions (for def/if).
 
   ## Binding Power
 
@@ -137,10 +152,6 @@ defmodule Hurricane.Parser do
   @call_bp 60
   @access_bp 60
 
-  ## DEFINITION KEYWORD DETECTION
-  # These keywords are NOT given special token kinds - they come through as
-  # :identifier, :paren_identifier, or :do_identifier. We dispatch by value.
-  # This aligns with Elixir's parser which treats def, defmodule, etc. as regular calls.
   ## PUBLIC API
 
   @doc """
@@ -201,7 +212,8 @@ defmodule Hurricane.Parser do
     {state, lhs} = parse_prefix(state, allow_do)
 
     # 2. Loop: while next op binds tighter than min_bp
-    parse_infix_loop(state, lhs, min_bp)
+    # Thread allow_do through so RHS of operators respects outer context
+    parse_infix_loop(state, lhs, min_bp, allow_do)
   end
 
   ## TOP LEVEL PARSING
@@ -354,32 +366,10 @@ defmodule Hurricane.Parser do
         {state, _} = State.advance(state)
         {state, nil}
 
-      # Special forms
-      State.at?(state, :case) ->
-        parse_case(state)
-
-      State.at?(state, :cond) ->
-        parse_cond(state)
-
-      # Note: if/unless are just macros - no special token kind needed.
-      # They come through as identifier/paren_identifier/do_identifier
-      # and are handled by the general call parsing paths.
-
-      State.at?(state, :with) ->
-        parse_with(state)
-
-      State.at?(state, :try) ->
-        parse_try(state)
-
-      State.at?(state, :receive) ->
-        parse_receive(state)
-
-      State.at?(state, :for) ->
-        parse_for(state)
-
-      State.at?(state, :quote) ->
-        parse_quote(state)
-
+      # Note: All "special forms" (case, cond, receive, with, try, for, quote,
+      # if, unless, def, etc.) are just regular calls. The parser detects stab
+      # clauses dynamically by looking for `->` in do block contents.
+      #
       # Identifiers and calls - different token types based on what follows
       # Plain identifier: variable or no-paren call (space before any parens/brackets)
       State.at?(state, :identifier) ->
@@ -405,22 +395,6 @@ defmodule Hurricane.Parser do
       # This is a no-parens call where the first arg starts with a unary operator
       State.at?(state, :op_identifier) ->
         parse_op_identifier(state, allow_do)
-
-      # Metaprogramming - these still need special token kinds
-      State.at?(state, :unquote) ->
-        parse_keyword_call(state, :unquote)
-
-      State.at?(state, :unquote_splicing) ->
-        parse_keyword_call(state, :unquote_splicing)
-
-      # Note: raise/reraise/throw/import/use/require/alias are just calls.
-      # They come through as identifier/paren_identifier/do_identifier
-      # and are handled by the general call parsing paths.
-      #
-      # def* keywords are also NOT special-cased here anymore.
-      # They come through as :identifier/:paren_identifier/:do_identifier
-      # and are handled by the general identifier parsing paths.
-      # Desugared syntax like defmodule(...) is parsed as a normal call.
 
       # Module aliases
       State.at?(state, :alias) ->
@@ -551,7 +525,7 @@ defmodule Hurricane.Parser do
 
   ## INFIX LOOP
 
-  defp parse_infix_loop(state, lhs, min_bp) do
+  defp parse_infix_loop(state, lhs, min_bp, allow_do) do
     token = State.current(state)
 
     # If there's a newline before an operator that can also be prefix,
@@ -564,9 +538,9 @@ defmodule Hurricane.Parser do
         {left_bp, right_bp} when left_bp >= min_bp ->
           # Infix operator: must consume at least the operator token
           state = State.advance_push(state)
-          {state, lhs} = parse_infix_op(state, lhs, token, right_bp)
+          {state, lhs} = parse_infix_op(state, lhs, token, right_bp, allow_do)
           state = State.advance_pop!(state)
-          parse_infix_loop(state, lhs, min_bp)
+          parse_infix_loop(state, lhs, min_bp, allow_do)
 
         _ ->
           # Check for postfix (call, access)
@@ -576,7 +550,7 @@ defmodule Hurricane.Parser do
           # If postfix consumed something, continue the loop to check for more infix/postfix
           if new_lhs != lhs do
             state = State.advance_pop!(state)
-            parse_infix_loop(state, new_lhs, min_bp)
+            parse_infix_loop(state, new_lhs, min_bp, allow_do)
           else
             # Legitimate exit: didn't consume anything
             state = State.advance_drop(state)
@@ -589,7 +563,7 @@ defmodule Hurricane.Parser do
   defp infix_bp(nil), do: nil
   defp infix_bp(%{kind: kind}), do: Map.get(@infix_bp, kind)
 
-  defp parse_infix_op(state, lhs, op_token, right_bp) do
+  defp parse_infix_op(state, lhs, op_token, right_bp, allow_do) do
     {state, _} = State.advance(state)
     meta = Ast.token_meta(op_token)
 
@@ -607,21 +581,21 @@ defmodule Hurricane.Parser do
       # Special handling for "not in" - produces {:not, _, [{:in, _, [lhs, rhs]}]}
       # Note: "not in" does not get newlines metadata
       op_token.kind == :"not in" ->
-        # RHS of binary op shouldn't consume do blocks
-        {state, rhs} = parse_expression(state, right_bp, allow_do: false)
+        # RHS inherits allow_do from outer context
+        {state, rhs} = parse_expression(state, right_bp, allow_do: allow_do)
         in_ast = {:in, meta, [lhs, rhs]}
         ast = {:not, meta, [in_ast]}
         {state, ast}
 
       # Special handling for range operator (..) - may become ternary step operator (..//)
       op_token.kind == :.. ->
-        {state, rhs} = parse_expression(state, right_bp, allow_do: false)
+        {state, rhs} = parse_expression(state, right_bp, allow_do: allow_do)
 
         # Check if followed by step operator (//)
         if State.at?(state, :"//") do
           {state, _step_token} = State.advance(state)
           # Parse the step value with same binding power
-          {state, step} = parse_expression(state, right_bp, allow_do: false)
+          {state, step} = parse_expression(state, right_bp, allow_do: allow_do)
           # Build ternary step operator: ..// (metadata from ..)
           ast = {:..//, meta, [lhs, rhs, step]}
           {state, ast}
@@ -631,8 +605,10 @@ defmodule Hurricane.Parser do
         end
 
       true ->
-        # RHS of binary op shouldn't consume do blocks - they belong to outer constructs
-        {state, rhs} = parse_expression(state, right_bp, allow_do: false)
+        # RHS inherits allow_do from outer context
+        # - Top level (allow_do: true): `a + b do` -> b consumes do
+        # - Inside argument (allow_do: false): `with x <- bar(x) do` -> bar(x) doesn't consume
+        {state, rhs} = parse_expression(state, right_bp, allow_do: allow_do)
         ast = Ast.binary_op(op_token.kind, meta_with_newlines, lhs, rhs)
         {state, ast}
     end
@@ -900,6 +876,10 @@ defmodule Hurricane.Parser do
   # - allow_do=true: parse as zero-arg call with do block (foo do ... end)
   # - allow_do=false: just return identifier, do belongs to outer construct
   defp parse_do_identifier(state, allow_do) do
+    # A do_identifier is marked by the tokenizer as being followed by `do`.
+    # Whether it consumes the do block depends on allow_do:
+    # - allow_do=true: parse as zero-arg call with do block (e.g., `foo |> case do`)
+    # - allow_do=false: just return as variable, do belongs to outer (e.g., `case foo do`)
     token = State.current(state)
     {state, _} = State.advance(state)
     meta = Ast.token_meta(token)
@@ -909,7 +889,8 @@ defmodule Hurricane.Parser do
       call_ast = {token.value, meta, []}
       maybe_parse_do_block(state, call_ast, meta)
     else
-      # Return as plain variable - do belongs to outer construct (case/if/etc)
+      # Either allow_do is false, or there's no do (shouldn't happen for do_identifier)
+      # Return as plain variable
       ast = Ast.var(token.value, meta)
       {state, ast}
     end
@@ -974,8 +955,10 @@ defmodule Hurricane.Parser do
   # Parse no-parens call arguments (similar to parse_keyword_call_args but simpler)
   defp parse_no_paren_args(state, acc) do
     # Stop at expression boundaries or do block
+    # Note: newline_before only stops if we haven't started parsing args yet (acc empty)
+    # After a comma, we continue across newlines (comma indicates continuation)
     if State.at_any?(state, [:do, :end, :else, :rescue, :catch, :after]) or
-         State.at_end?(state) or State.newline_before?(state) do
+         State.at_end?(state) or (acc == [] and State.newline_before?(state)) do
       {state, Enum.reverse(acc)}
     else
       state = State.advance_push(state)
@@ -1014,6 +997,11 @@ defmodule Hurricane.Parser do
   # Supports do/else/rescue/catch/after clauses
   defp maybe_parse_do_block(state, {name, meta, args}, original_meta) when is_list(args) do
     if State.at?(state, :do) do
+      # Track block for indentation-aware recovery
+      # Use the opening keyword's column (from original_meta)
+      block_column = Keyword.get(original_meta, :column, 1)
+      state = State.push_block(state, block_column, :do)
+
       {state, do_token} = State.advance(state)
       # Stop at any clause keyword, not just else/end
       {state, body} = parse_block_until(state, [:else, :rescue, :catch, :after, :end])
@@ -1022,6 +1010,9 @@ defmodule Hurricane.Parser do
       {state, clauses} = parse_do_block_clauses(state, do: body)
 
       {state, end_token} = State.expect(state, :end)
+
+      # Pop block stack after consuming end
+      state = State.pop_block(state)
 
       call_meta = Ast.with_do_end(original_meta, do_token, end_token)
       ast = {name, call_meta, args ++ [clauses]}
@@ -1058,51 +1049,6 @@ defmodule Hurricane.Parser do
 
       true ->
         {state, acc}
-    end
-  end
-
-  # Parse keyword calls like raise, throw, unquote etc.
-  defp parse_keyword_call(state, name) do
-    token = State.current(state)
-    {state, _} = State.advance(state)
-    meta = Ast.token_meta(token)
-
-    # Check for call with parens
-    if State.at?(state, :lparen) do
-      {state, _} = State.advance(state)
-      {state, args} = parse_call_args(state)
-      {state, closing} = State.expect(state, :rparen)
-
-      call_meta = if closing, do: Ast.with_closing(meta, closing), else: meta
-      ast = Ast.call(name, call_meta, args)
-      {state, ast}
-    else
-      # No parens - parse comma-separated arguments
-      {state, args} = parse_keyword_call_args(state, [])
-      ast = Ast.call(name, meta, args)
-      {state, ast}
-    end
-  end
-
-  defp parse_keyword_call_args(state, acc) do
-    # Check for end of arguments - stop at expression boundaries
-    if State.at_any?(state, Recovery.expression()) or State.at_end?(state) do
-      {state, Enum.reverse(acc)}
-    else
-      # Use parse_call_arg to properly handle keyword arguments
-      state = State.advance_push(state)
-      {state, arg} = parse_call_arg(state)
-      state = State.advance_pop!(state)
-
-      # Keyword args return a keyword list, keep it as a single arg
-      acc = [arg | acc]
-
-      if State.at?(state, :comma) do
-        {state, _comma} = State.advance(state)
-        parse_keyword_call_args(state, acc)
-      else
-        {state, Enum.reverse(acc)}
-      end
     end
   end
 
@@ -1362,7 +1308,9 @@ defmodule Hurricane.Parser do
       tokens: normalized,
       pos: 0,
       errors: [],
-      checkpoints: []
+      checkpoints: [],
+      block_stack: [],
+      ast: nil
     }
 
     # Track first token before skipping - used for empty block position if #{;}
@@ -2076,8 +2024,14 @@ defmodule Hurricane.Parser do
     {state, fn_token} = State.advance(state)
     meta = Ast.token_meta(fn_token)
 
+    # Track fn block for indentation-aware recovery
+    state = State.push_block(state, fn_token.column, :fn)
+
     {state, clauses} = parse_fn_clauses(state)
     {state, end_token} = State.expect(state, :end)
+
+    # Pop block stack after consuming end
+    state = State.pop_block(state)
 
     # Add closing metadata for the end token
     meta = if end_token, do: Ast.with_closing(meta, end_token), else: meta
@@ -2404,288 +2358,7 @@ defmodule Hurricane.Parser do
     end
   end
 
-  ## SPECIAL FORMS
-
-  # case expr do clauses end
-  defp parse_case(state) do
-    {state, case_token} = State.advance(state)
-    meta = Ast.token_meta(case_token)
-
-    # Parse the expression being matched
-    # Use allow_do: false because the `do` belongs to case, not the expression
-    {state, expr} = parse_expression(state, 0, allow_do: false)
-
-    # Parse do block with stab clauses
-    {state, clauses, do_token, end_token} = parse_stab_block(state)
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    ast = {:case, meta, [expr, [do: clauses]]}
-    {state, ast}
-  end
-
-  # cond do clauses end
-  defp parse_cond(state) do
-    {state, cond_token} = State.advance(state)
-    meta = Ast.token_meta(cond_token)
-
-    {state, clauses, do_token, end_token} = parse_stab_block(state)
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    ast = {:cond, meta, [[do: clauses]]}
-    {state, ast}
-  end
-
-  # Note: if/unless are just macros - no special parsing needed.
-  # They're handled by the general identifier/call parsing paths.
-
-  # with clauses do body else else_clauses end
-  defp parse_with(state) do
-    {state, with_token} = State.advance(state)
-    meta = Ast.token_meta(with_token)
-
-    # Parse with clauses (pattern <- expr, ...)
-    {state, clauses} = parse_with_clauses(state)
-
-    # Parse do block
-    {state, do_token} = State.expect(state, :do)
-    {state, body} = parse_block_until(state, [:else, :end])
-
-    {state, else_clauses, end_token} =
-      if State.at?(state, :else) do
-        {state, _} = State.advance(state)
-        {state, else_clauses, _, end_token} = parse_stab_block_inner(state)
-        {state, else_clauses, end_token}
-      else
-        {state, end_token} = State.expect(state, :end)
-        {state, nil, end_token}
-      end
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    body_kw = if else_clauses, do: [do: body, else: else_clauses], else: [do: body]
-    ast = {:with, meta, clauses ++ [body_kw]}
-    {state, ast}
-  end
-
-  defp parse_with_clauses(state) do
-    {state, clause} = parse_with_clause(state)
-
-    case State.eat(state, :comma) do
-      {:ok, state, _} ->
-        if State.at?(state, :do) or State.at?(state, :kw_identifier) do
-          {state, [clause]}
-        else
-          {state, rest} = parse_with_clauses(state)
-          {state, [clause | rest]}
-        end
-
-      {:error, state} ->
-        {state, [clause]}
-    end
-  end
-
-  defp parse_with_clause(state) do
-    # Can be pattern <- expr or just expr (for guards)
-    # allow_do: false because the do belongs to with, not the clause
-    {state, expr} = parse_expression(state, 0, allow_do: false)
-    {state, expr}
-  end
-
-  # try do body rescue/catch/after end
-  defp parse_try(state) do
-    {state, try_token} = State.advance(state)
-    meta = Ast.token_meta(try_token)
-
-    {state, do_token} = State.expect(state, :do)
-    {state, body} = parse_block_until(state, [:rescue, :catch, :else, :after, :end])
-
-    # Parse optional sections
-    {state, sections} = parse_try_sections(state, do: body)
-
-    {state, end_token} = State.expect(state, :end)
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    ast = {:try, meta, [sections]}
-    {state, ast}
-  end
-
-  defp parse_try_sections(state, acc) do
-    cond do
-      State.at?(state, :rescue) ->
-        state = State.advance_push(state)
-        {state, _} = State.advance(state)
-        # Don't use parse_stab_block_inner - it expects :end
-        # parse_stab_clauses stops at :catch/:after/:end
-        {state, clauses} = parse_stab_clauses(state, [])
-        state = State.advance_pop!(state)
-        # Append to end to preserve order: do, rescue, catch, else, after
-        parse_try_sections(state, acc ++ [rescue: clauses])
-
-      State.at?(state, :catch) ->
-        state = State.advance_push(state)
-        {state, _} = State.advance(state)
-        {state, clauses} = parse_stab_clauses(state, [])
-        state = State.advance_pop!(state)
-        parse_try_sections(state, acc ++ [catch: clauses])
-
-      State.at?(state, :else) ->
-        state = State.advance_push(state)
-        {state, _} = State.advance(state)
-        {state, clauses} = parse_stab_clauses(state, [])
-        state = State.advance_pop!(state)
-        parse_try_sections(state, acc ++ [else: clauses])
-
-      State.at?(state, :after) ->
-        state = State.advance_push(state)
-        {state, _} = State.advance(state)
-        {state, body} = parse_block_until(state, [:end])
-        state = State.advance_pop!(state)
-        parse_try_sections(state, acc ++ [after: body])
-
-      true ->
-        {state, acc}
-    end
-  end
-
-  # receive do clauses after timeout -> body end
-  defp parse_receive(state) do
-    {state, receive_token} = State.advance(state)
-    meta = Ast.token_meta(receive_token)
-
-    {state, do_token} = State.expect(state, :do)
-    # Use parse_stab_clauses directly - it stops at :after/:end
-    {state, clauses} = parse_stab_clauses(state, [])
-
-    {state, after_clause, end_token} =
-      if State.at?(state, :after) do
-        {state, _} = State.advance(state)
-        # After section also uses stab clauses (timeout -> body)
-        {state, after_clauses} = parse_stab_clauses(state, [])
-        {state, end_token} = State.expect(state, :end)
-        {state, after_clauses, end_token}
-      else
-        {state, end_token} = State.expect(state, :end)
-        {state, nil, end_token}
-      end
-
-    meta = Ast.with_do_end(meta, do_token, end_token)
-    body_kw = if after_clause, do: [do: clauses, after: after_clause], else: [do: clauses]
-    ast = {:receive, meta, [body_kw]}
-    {state, ast}
-  end
-
-  # for generators, filters, into: ..., do: body
-  defp parse_for(state) do
-    {state, for_token} = State.advance(state)
-    meta = Ast.token_meta(for_token)
-
-    {state, clauses} = parse_for_clauses(state)
-
-    # Check for do block or keyword
-    {state, body_kw, meta} =
-      if State.at?(state, :do) do
-        {state, do_token} = State.advance(state)
-        {state, body} = parse_block_until(state, [:end])
-        {state, end_token} = State.expect(state, :end)
-        updated_meta = Ast.with_do_end(meta, do_token, end_token)
-        # Wrap in list so it stays as single keyword list element when appended
-        {state, [[do: body]], updated_meta}
-      else
-        # Already have keyword pairs in clauses
-        {state, [], meta}
-      end
-
-    ast = {:for, meta, clauses ++ body_kw}
-    {state, ast}
-  end
-
-  defp parse_for_clauses(state) do
-    # allow_do: false because the do belongs to for, not the clause
-    {state, clause} = parse_expression(state, 0, allow_do: false)
-
-    case State.eat(state, :comma) do
-      {:ok, state, _} ->
-        if State.at?(state, :do) or State.at?(state, :kw_identifier) do
-          # Check if it's do: keyword - keep as single keyword list element
-          if State.at?(state, :kw_identifier) do
-            {state, kw} = parse_keyword_pairs(state)
-            # kw is a keyword list like [do: body], keep it as a single arg
-            {state, [clause, kw]}
-          else
-            {state, [clause]}
-          end
-        else
-          {state, rest} = parse_for_clauses(state)
-          {state, [clause | rest]}
-        end
-
-      {:error, state} ->
-        {state, [clause]}
-    end
-  end
-
-  # quote do body end  OR  quote do: expr
-  defp parse_quote(state) do
-    {state, quote_token} = State.advance(state)
-    meta = Ast.token_meta(quote_token)
-
-    # Check if next is kw_identifier with value :do (shorthand form: quote do: expr)
-    token = State.current(state)
-    is_shorthand_do = State.at?(state, :kw_identifier) and token != nil and token.value == :do
-
-    cond do
-      # Block form: quote do ... end
-      State.at?(state, :do) ->
-        {state, do_token} = State.advance(state)
-        {state, body} = parse_block_until(state, [:end])
-        {state, end_token} = State.expect(state, :end)
-        meta = Ast.with_do_end(meta, do_token, end_token)
-        ast = {:quote, meta, [[do: body]]}
-        {state, ast}
-
-      # Shorthand form: quote do: expr (kw_identifier with value :do)
-      is_shorthand_do ->
-        {state, kwargs} = parse_keyword_pairs(state)
-        ast = {:quote, meta, [kwargs]}
-        {state, ast}
-
-      # Block form with options: quote opts do ... end
-      State.at?(state, :kw_identifier) ->
-        # Parse options before do block
-        {state, opts} = parse_keyword_pairs(state)
-        {state, do_token} = State.expect(state, :do)
-        {state, body} = parse_block_until(state, [:end])
-        {state, end_token} = State.expect(state, :end)
-        meta = Ast.with_do_end(meta, do_token, end_token)
-        # Options are wrapped in a list
-        ast = {:quote, meta, [opts, [do: body]]}
-        {state, ast}
-
-      true ->
-        # Fallback - try to parse as options then do block
-        {state, opts} = parse_keyword_pairs(state)
-        {state, do_token} = State.expect(state, :do)
-        {state, body} = parse_block_until(state, [:end])
-        {state, end_token} = State.expect(state, :end)
-        meta = Ast.with_do_end(meta, do_token, end_token)
-        # Options are wrapped in a list
-        ast = {:quote, meta, [opts, [do: body]]}
-        {state, ast}
-    end
-  end
-
-  ## HELPER: PARSE BLOCK WITH STAB CLAUSES
-
-  defp parse_stab_block(state) do
-    {state, do_token} = State.expect(state, :do)
-    {state, clauses, _, end_token} = parse_stab_block_inner(state)
-    {state, clauses, do_token, end_token}
-  end
-
-  defp parse_stab_block_inner(state) do
-    {state, clauses} = parse_stab_clauses(state, [])
-    {state, end_token} = State.expect(state, :end)
-    {state, clauses, nil, end_token}
-  end
+  ## STAB CLAUSE PARSING
 
   defp parse_stab_clauses(state, acc) do
     # Stop at block terminators, definition patterns (for recovery), or orphan delimiters
@@ -2806,19 +2479,27 @@ defmodule Hurricane.Parser do
     end
   end
 
-  # Look for arrow within a short distance, tracking bracket depth
+  # Look for arrow within a short distance, tracking nesting depth
   # to allow commas inside tuple patterns like {:ok, x} ->
   # Also ensure the arrow is on a nearby line (not across a blank line)
+  #
+  # STRUCTURAL APPROACH: We track depth for ALL nesting constructs:
+  # - Brackets: {} [] ()
+  # - do/end blocks
+  # - fn/end blocks
+  #
+  # This means we don't need to know which identifier started a do block -
+  # any `->` inside a do/end belongs to that block, not the outer context.
   defp peek_for_arrow_simple(state, depth, max) do
     current = State.current(state)
     start_line = if current, do: current.line, else: 0
     peek_for_arrow_depth(state, depth, max, 0, start_line)
   end
 
-  defp peek_for_arrow_depth(_state, depth, max, _bracket_depth, _start_line) when depth >= max,
+  defp peek_for_arrow_depth(_state, depth, max, _nesting_depth, _start_line) when depth >= max,
     do: false
 
-  defp peek_for_arrow_depth(state, depth, max, bracket_depth, start_line) do
+  defp peek_for_arrow_depth(state, depth, max, nesting_depth, start_line) do
     tokens = state.tokens
     pos = state.pos + depth
 
@@ -2826,97 +2507,181 @@ defmodule Hurricane.Parser do
       nil ->
         false
 
-      # Found arrow at top level (outside any brackets)
+      # Found arrow at top level (outside any nesting)
       # Also check it's on the same line or adjacent line (no blank line gap)
-      %{kind: :->, line: arrow_line} when bracket_depth == 0 ->
+      %{kind: :->, line: arrow_line} when nesting_depth == 0 ->
         arrow_line - start_line <= 1
 
+      # Arrow inside nested construct - skip it
       %{kind: :->} ->
-        peek_for_arrow_depth(state, depth + 1, max, bracket_depth, start_line)
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth, start_line)
 
-      # Terminators - stop searching
+      # Block terminators at depth 0 - stop searching (we've hit outer structure)
+      %{kind: :end} when nesting_depth == 0 ->
+        false
+
+      %{kind: :else} when nesting_depth == 0 ->
+        false
+
+      %{kind: :rescue} when nesting_depth == 0 ->
+        false
+
+      %{kind: :catch} when nesting_depth == 0 ->
+        false
+
+      %{kind: :after} when nesting_depth == 0 ->
+        false
+
+      # `end` inside nested block - decrease depth
       %{kind: :end} ->
-        false
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth - 1, start_line)
 
+      # Block keywords that decrease depth when we later see `end`
+      # (else/rescue/catch/after don't change depth, they're siblings)
       %{kind: :else} ->
-        false
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth, start_line)
 
       %{kind: :rescue} ->
-        false
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth, start_line)
 
       %{kind: :catch} ->
-        false
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth, start_line)
 
       %{kind: :after} ->
-        false
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth, start_line)
+
+      # `do` increases nesting depth - any arrows inside belong to this block
+      %{kind: :do} ->
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth + 1, start_line)
+
+      # `fn` also starts a block that ends with `end`
+      %{kind: :fn} ->
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth + 1, start_line)
 
       # Track bracket depth
       %{kind: :lbrace} ->
-        peek_for_arrow_depth(state, depth + 1, max, bracket_depth + 1, start_line)
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth + 1, start_line)
 
       %{kind: :rbrace} ->
-        peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
+        peek_for_arrow_depth(state, depth + 1, max, max(0, nesting_depth - 1), start_line)
 
       %{kind: :lbracket} ->
-        peek_for_arrow_depth(state, depth + 1, max, bracket_depth + 1, start_line)
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth + 1, start_line)
 
       %{kind: :rbracket} ->
-        peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
+        peek_for_arrow_depth(state, depth + 1, max, max(0, nesting_depth - 1), start_line)
 
       %{kind: :lparen} ->
-        peek_for_arrow_depth(state, depth + 1, max, bracket_depth + 1, start_line)
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth + 1, start_line)
 
       %{kind: :rparen} ->
-        peek_for_arrow_depth(state, depth + 1, max, max(0, bracket_depth - 1), start_line)
+        peek_for_arrow_depth(state, depth + 1, max, max(0, nesting_depth - 1), start_line)
 
       # Note: We allow comma at top level because catch clauses use :kind, pattern -> body
       # The arrow line check prevents false positives from distant commas
 
-      # Keywords that have their own stab clauses - stop searching
-      # The -> inside these belongs to their inner clauses, not outer pattern
-      %{kind: :case} ->
-        false
-
-      %{kind: :cond} ->
-        false
-
-      %{kind: :fn} ->
-        false
-
-      %{kind: :receive} ->
-        false
-
       _ ->
-        peek_for_arrow_depth(state, depth + 1, max, bracket_depth, start_line)
+        peek_for_arrow_depth(state, depth + 1, max, nesting_depth, start_line)
     end
   end
 
-  ## HELPER: PARSE BLOCK UNTIL TERMINATOR
+  ## HELPER: PARSE DO BLOCK BODY WITH DYNAMIC STAB DETECTION
+  #
+  # This is the heart of Elixir's unified parsing approach. The parser doesn't
+  # know in advance whether a do block contains expressions or stab clauses.
+  # It discovers this by looking for `->` after parsing the first item.
+  #
+  # For `if x do 1 end` - no arrow, so expressions
+  # For `case x do :a -> 1 end` - arrow found, so stab clauses
+  #
+  # Returns:
+  # - For expression blocks: single expr or {:__block__, [], exprs}
+  # - For stab blocks: list of {:->, meta, [patterns, body]} clauses
 
   defp parse_block_until(state, terminators) do
-    {state, exprs} = parse_block_until_exprs(state, terminators, [])
-    # Empty do blocks require {:__block__, [], []} not nil
-    # This matches Elixir's behavior: `foo do end` produces [do: {:__block__, [], []}]
-    ast =
-      case Enum.reverse(exprs) do
-        [] ->
-          {:__block__, [], []}
+    cond do
+      # Check for empty block first
+      State.at_any?(state, terminators) or State.at_end?(state) ->
+        {state, {:__block__, [], []}}
 
-        # unquote_splicing must always be wrapped in a block because it can expand
-        # to multiple expressions at compile time
-        [{:unquote_splicing, _, _} = single] ->
-          {:__block__, [], [single]}
+      # Orphan closing delimiters at start - error recovery
+      State.at_any?(state, Recovery.closing_delimiters()) ->
+        token = State.current(state)
+        state = State.add_error(state, "unexpected #{inspect(token.kind)}")
+        {state, _} = State.advance(state)
+        parse_block_until(state, terminators)
 
-        [single] ->
-          single
+      # Stray -> at start of block - error recovery
+      State.at?(state, :->) ->
+        state = State.add_error(state, "unexpected ->")
+        {state, _} = State.advance(state)
+        parse_block_until(state, terminators)
 
-        multiple ->
-          {:__block__, [], multiple}
-      end
+      # Stray block keywords at start - error recovery
+      State.at_any?(state, [:do, :rescue, :catch, :else, :after]) ->
+        token = State.current(state)
+        state = State.add_error(state, "unexpected #{token.kind}")
+        {state, _} = State.advance(state)
+        parse_block_until(state, terminators)
 
-    {state, ast}
+      true ->
+        # Parse the first expression
+        state = State.advance_push(state)
+        {state, first_expr} = parse_expression(state, 0)
+        state = State.advance_pop!(state)
+
+        cond do
+          # If followed by ->, this is a stab block
+          # The first "expression" was actually a pattern
+          State.at?(state, :->) ->
+            parse_stab_block_from_first(state, first_expr, terminators)
+
+          # Otherwise, expression block - continue parsing expressions
+          true ->
+            first_expr = add_end_of_expression(state, first_expr)
+            acc = if first_expr != nil, do: [first_expr], else: []
+            {state, exprs} = parse_block_until_exprs(state, terminators, acc)
+            ast = build_block_ast(Enum.reverse(exprs))
+            {state, ast}
+        end
+    end
   end
 
+  # After detecting ->, parse the rest as stab clauses
+  # first_expr is the pattern for the first clause
+  defp parse_stab_block_from_first(state, first_pattern, terminators) do
+    # Consume the -> and parse the first clause's body
+    {state, arrow_token} = State.advance(state)
+    arrow_meta = Ast.token_meta(arrow_token)
+
+    {state, first_body} = parse_stab_body(state)
+
+    # Build the first clause - pattern becomes a list
+    first_clause = {:->, arrow_meta, [[first_pattern], first_body]}
+
+    # Parse remaining clauses
+    {state, rest_clauses} = parse_remaining_stab_clauses(state, terminators, [])
+
+    {state, [first_clause | rest_clauses]}
+  end
+
+  # Parse remaining stab clauses after the first one
+  defp parse_remaining_stab_clauses(state, terminators, acc) do
+    if State.at_any?(state, terminators) or State.at_end?(state) or
+         State.at_any?(state, Recovery.closing_delimiters()) or
+         Recovery.looks_like_definition?(state) do
+      {state, Enum.reverse(acc)}
+    else
+      state = State.advance_push(state)
+      {state, clause} = parse_stab_clause(state)
+      state = State.advance_pop!(state)
+
+      acc = if clause, do: [clause | acc], else: acc
+      parse_remaining_stab_clauses(state, terminators, acc)
+    end
+  end
+
+  # Continue parsing expressions in an expression block
   defp parse_block_until_exprs(state, terminators, acc) do
     cond do
       State.at_any?(state, terminators) or State.at_end?(state) ->
@@ -2936,7 +2701,7 @@ defmodule Hurricane.Parser do
         {state, _} = State.advance(state)
         parse_block_until_exprs(state, terminators, acc)
 
-      # Stray :-> - skip with error
+      # Stray :-> in expression block - skip with error
       State.at?(state, :->) ->
         state = State.add_error(state, "unexpected ->")
         {state, _} = State.advance(state)
@@ -2952,6 +2717,24 @@ defmodule Hurricane.Parser do
 
         acc = if expr != nil, do: [expr | acc], else: acc
         parse_block_until_exprs(state, terminators, acc)
+    end
+  end
+
+  # Build AST from list of expressions
+  defp build_block_ast(exprs) do
+    case exprs do
+      [] ->
+        {:__block__, [], []}
+
+      # unquote_splicing must always be wrapped in a block
+      [{:unquote_splicing, _, _} = single] ->
+        {:__block__, [], [single]}
+
+      [single] ->
+        single
+
+      multiple ->
+        {:__block__, [], multiple}
     end
   end
 end

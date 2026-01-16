@@ -226,34 +226,19 @@ defmodule Hurricane.Token do
 
   # Normalize identifier to check for keywords
   #
-  # Philosophy: Elixir is implemented in terms of itself. Most "keywords" are just
-  # macros following normal call syntax. Only a handful need special token kinds:
+  # Philosophy: Elixir is implemented in terms of itself. Almost all "keywords" are
+  # just macros following normal call syntax. The parser detects stab clauses
+  # dynamically by looking for `->` in do block contents.
   #
-  # 1. Stab clause forms - their do blocks contain `pattern -> body` clauses
-  # 2. Generator forms - have special `<-` syntax
-  # 3. Try - has rescue/catch/else/after block sections
-  # 4. Metaprogramming - quote/unquote need special handling
-  # 5. Block structure - do/end/rescue/catch/else/after/when
-  # 6. Operators that look like identifiers - and/or/not/in
+  # Only these need special token kinds:
+  # 1. Block structure - do/end/rescue/catch/else/after/when (control flow)
+  # 2. Operators that look like identifiers - and/or/not/in
   #
-  # Everything else (if, unless, raise, import, use, def, defmodule...) is just
-  # a regular call and needs no special token kind.
+  # Everything else (case, cond, if, unless, try, with, for, quote, raise,
+  # import, use, def, defmodule...) is just a regular call.
   defp normalize_identifier(value) when is_atom(value) do
     case value do
-      # Stab clause forms - do block contains pattern -> body
-      :case -> :case
-      :cond -> :cond
-      :receive -> :receive
-      # Generator forms - special <- syntax
-      :with -> :with
-      :for -> :for
-      # Try - has block sections
-      :try -> :try
-      # Metaprogramming
-      :quote -> :quote
-      :unquote -> :unquote
-      :unquote_splicing -> :unquote_splicing
-      # Block structure keywords
+      # Block structure keywords - needed for do/end block parsing
       :do -> :do
       :end -> :end
       :rescue -> :rescue
@@ -266,7 +251,7 @@ defmodule Hurricane.Token do
       :or -> :or
       :not -> :not
       :in -> :in
-      # Everything else is just an identifier (including if, unless, def, import, etc.)
+      # Everything else is just an identifier
       _ -> :identifier
     end
   end

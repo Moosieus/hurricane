@@ -1,40 +1,37 @@
 defmodule Hurricane.Parser.Recovery do
   @moduledoc """
-  Recovery set definitions for resilient parsing.
+  Recovery sets and IDE heuristics for resilient parsing.
 
-  ## Philosophy: Pattern-Based Definition Detection
+  ## Three-Layer Recovery
 
-  Like Elixir's actual parser (elixir_parser.yrl), we don't treat `def`, `defmodule`,
-  etc. as special keywords at the syntax level. They're all just regular calls with
-  do blocks. This means `def`, `defn`, `defmemo`, and any custom definition macro
-  are handled uniformly.
+  **Layer 1: Recovery Sets (Structural)**
 
-  Definition forms are detected by pattern: `identifier` followed by
-  `identifier|paren_identifier|do_identifier|alias`. This catches:
-  - `def foo(x)` - def is identifier, foo is paren_identifier
-  - `defmodule Foo` - defmodule is identifier, Foo is alias
-  - `defn softmax(t)` - defn is identifier, softmax is paren_identifier
-
-  ## Recovery Sets
-
-  Recovery sets define "sync tokens" - structural tokens that definitively end
-  a construct (`:end`, `:eof`, `:->`  etc.). Definition boundaries are detected
-  by pattern, not enumerated in recovery sets.
-
-  ## Usage
-
-  For definition contexts, use `at_definition_boundary?/2`:
-
-      if Recovery.at_definition_boundary?(state, Recovery.params()) do
-        # Stop - we've hit a definition form OR structural token
-        ...
-      end
-
-  For non-definition contexts, use `at_recovery?/2`:
+  Token-based sync points that definitively end a construct: `:end`, `:eof`,
+  `:->`, closing delimiters, block keywords. Use with `at_recovery?/2`:
 
       if Recovery.at_recovery?(state, Recovery.collection()) do
-        # Stop - we've hit a structural token
-        ...
+        # Hit closing delimiter, :end, or :eof
+      end
+
+  **Layer 2: Indentation Detection (Primary Heuristic)**
+
+  When the current token's column is at or before the block's opening column,
+  we've likely left that block. Uses `should_close_block?/1`:
+
+      if Recovery.should_close_block?(state) do
+        # Token dedented past block start - close the block
+      end
+
+  This works for ALL `do/end` constructs uniformly: `defmodule`, `def`, `case`,
+  Phoenix's `scope`, ExUnit's `describe`, custom macros, etc.
+
+  **Layer 3: Definition Detection (Secondary/Tiebreaker)**
+
+  When indentation is ambiguous (same column as block start), the `def*` naming
+  convention provides a secondary signal. Use `at_block_boundary?/2`:
+
+      if Recovery.at_block_boundary?(state, Recovery.params()) do
+        # Hit structural token OR dedented OR `def foo(...)`
       end
   """
 
@@ -173,53 +170,53 @@ defmodule Hurricane.Parser.Recovery do
     ]
   end
 
-  ## PATTERN-BASED DETECTION
-
-  # Keywords that should not trigger definition detection when they appear
-  # as the first identifier. These are:
-  # - Operators: and, or, not, in, when
-  # - Common macros that take expressions: if, unless, raise, throw, import, etc.
+  ## INDENTATION-BASED DETECTION (PRIMARY HEURISTIC)
   #
-  # We exclude these because `if user` shouldn't look like a definition, even though
-  # it matches the pattern "identifier followed by identifier".
-  @non_definition_identifiers [
-    # Operators
-    :and,
-    :or,
-    :not,
-    :in,
-    :when,
-    # Control flow macros
-    :if,
-    :unless,
-    :raise,
-    :reraise,
-    :throw,
-    # Directive macros
-    :import,
-    :alias,
-    :require,
-    :use
-  ]
+  # Elixir's formatter enforces 2-space indentation, making column position
+  # a reliable signal of intended structure. When a token dedents past the
+  # opening keyword's column, we've likely left that block.
+
+  @doc """
+  Check if we should close the current block based on indentation.
+
+  Returns true if the current token's column is at or before the innermost
+  block's opening column - a strong signal we've left that block.
+
+  This works uniformly for all `do/end` constructs:
+  - `defmodule`, `def`, `defp`, `defmacro`
+  - `case`, `cond`, `if`, `unless`, `with`
+  - `scope`, `pipeline` (Phoenix)
+  - `describe`, `test` (ExUnit)
+  - Any custom macro with do/end
+  """
+  def should_close_block?(state) do
+    case State.current_block(state) do
+      nil ->
+        false
+
+      {block_start_col, _type} ->
+        current_token = State.current(state)
+
+        case current_token do
+          nil -> false
+          %{column: current_col} -> current_col <= block_start_col
+        end
+    end
+  end
+
+  ## DEFINITION DETECTION (SECONDARY HEURISTIC/TIEBREAKER)
+  #
+  # When indentation is ambiguous (same column as block start), the `def*`
+  # naming convention provides a secondary signal. This is NOT part of
+  # structural parsing - it's an IDE heuristic for better mid-edit recovery.
 
   @doc """
   Check if the current position looks like a definition form.
 
-  Detects the pattern: `identifier` followed by `identifier|paren_identifier|do_identifier|alias`
-
-  This catches ALL definition forms uniformly - both built-in (def, defmodule, defmacro)
-  and custom (defn, defmemo, defrpc). This aligns with how Elixir's parser works: it
-  doesn't know about def as special syntax, just as a regular call with a do block.
-
-  Examples that match:
-  - `def foo(x)` - def is identifier, foo is paren_identifier
-  - `defmodule Foo do` - defmodule is identifier, Foo is alias
-  - `defn softmax(t)` - defn is identifier, softmax is paren_identifier
-
-  Examples that don't match:
-  - `Logger.info` - Logger is alias, not identifier
-  - `and foo` - and is excluded as a keyword
-  - `user ... s` - tokens separated by blank line aren't definitions
+  Uses Elixir's `def*` naming convention as a tiebreaker when indentation
+  is ambiguous. Catches standard and custom definition macros:
+  - Standard: def, defp, defmacro, defmodule, defstruct, etc.
+  - Libraries: defn (Nx), defmemo, defrpc, etc.
   """
   def looks_like_definition?(state) do
     current = State.current(state)
@@ -228,24 +225,44 @@ defmodule Hurricane.Parser.Recovery do
     case {current, next} do
       {%{kind: :identifier, value: name, line: curr_line}, %{kind: next_kind, line: next_line}}
       when next_kind in [:identifier, :paren_identifier, :do_identifier, :alias] and
-             name not in @non_definition_identifiers and
              next_line - curr_line <= 1 ->
-        true
+        definition_like_name?(name)
 
       _ ->
         false
     end
   end
 
+  # Check if identifier follows Elixir's "def*" convention for definitions
+  defp definition_like_name?(name) when is_atom(name) do
+    name
+    |> Atom.to_string()
+    |> String.starts_with?("def")
+  end
+
+  @doc """
+  Check if at a block boundary (all three layers combined).
+
+  1. Structural: current token is in recovery_set
+  2. Indentation: current token dedented past block start
+  3. Definition: current token looks like `def* name` (tiebreaker)
+
+  Use this in loops that need to detect when to close a block.
+  """
+  def at_block_boundary?(state, recovery_set) do
+    State.at_any?(state, recovery_set) or
+      should_close_block?(state) or
+      looks_like_definition?(state)
+  end
+
   @doc """
   Check if at a definition boundary (token-based OR pattern-based).
 
-  Since def* keywords are no longer given special token kinds (they stay as identifiers),
-  ALL definition forms (def, defmodule, defn, defmemo, etc.) are detected by pattern.
-  The recovery_set catches structural tokens like :end, :@, :eof.
+  DEPRECATED: Use `at_block_boundary?/2` instead, which includes indentation.
+  Kept for backwards compatibility.
   """
   def at_definition_boundary?(state, recovery_set) do
-    State.at_any?(state, recovery_set) or looks_like_definition?(state)
+    at_block_boundary?(state, recovery_set)
   end
 
   ## RECOVERY OPERATIONS

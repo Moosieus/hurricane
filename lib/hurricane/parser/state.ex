@@ -38,7 +38,8 @@ defmodule Hurricane.Parser.State do
     :pos,
     :checkpoints,
     :errors,
-    :ast
+    :ast,
+    :block_stack
   ]
 
   @type t :: %__MODULE__{
@@ -46,7 +47,8 @@ defmodule Hurricane.Parser.State do
           pos: non_neg_integer(),
           checkpoints: [non_neg_integer()],
           errors: [{map(), String.t()}],
-          ast: any()
+          ast: any(),
+          block_stack: [{pos_integer(), atom()}]
         }
 
   @doc """
@@ -58,7 +60,8 @@ defmodule Hurricane.Parser.State do
       pos: 0,
       checkpoints: [],
       errors: [],
-      ast: nil
+      ast: nil,
+      block_stack: []
     }
   end
 
@@ -323,4 +326,32 @@ defmodule Hurricane.Parser.State do
   """
   def token_meta(nil), do: [line: 1, column: 1]
   def token_meta(token), do: [line: token.line, column: token.column]
+
+  ## BLOCK STACK (for indentation-aware recovery)
+
+  @doc """
+  Push a block onto the stack when entering a do/end block.
+  Tracks the opening keyword's column for indentation-based recovery.
+  """
+  def push_block(state, column, type \\ :do) do
+    %{state | block_stack: [{column, type} | state.block_stack]}
+  end
+
+  @doc """
+  Pop a block from the stack when exiting a do/end block.
+  """
+  def pop_block(state) do
+    case state.block_stack do
+      [_ | rest] -> %{state | block_stack: rest}
+      [] -> state
+    end
+  end
+
+  @doc """
+  Get the current (innermost) block, or nil if not in a block.
+  Returns `{column, type}` tuple.
+  """
+  def current_block(state) do
+    List.first(state.block_stack)
+  end
 end
