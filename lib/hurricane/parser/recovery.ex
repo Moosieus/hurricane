@@ -277,38 +277,63 @@ defmodule Hurricane.Parser.Recovery do
   @doc """
   Skip tokens until we reach one in the recovery set.
   Returns the state positioned at the first recovery token.
+  Increments recovery counter when actually skipping tokens.
   """
   def sync_to(state, recovery_set) do
     if State.at_any?(state, recovery_set) or State.at_end?(state) do
       state
     else
+      # We're about to skip - increment the recovery counter
+      state = State.increment_recovery_count(state)
+      do_sync_to(state, recovery_set)
+    end
+  end
+
+  defp do_sync_to(state, recovery_set) do
+    if State.at_any?(state, recovery_set) or State.at_end?(state) do
+      state
+    else
       {state, _token} = State.advance(state)
-      sync_to(state, recovery_set)
+      do_sync_to(state, recovery_set)
     end
   end
 
   @doc """
   Skip tokens until we reach one in the recovery set, emitting a single error.
+  Increments recovery counter when actually skipping tokens.
   """
   def sync_to_with_error(state, recovery_set, message) do
     if State.at_any?(state, recovery_set) or State.at_end?(state) do
       state
     else
+      # We're about to skip - increment the recovery counter
+      state = State.increment_recovery_count(state)
       state = State.add_error(state, message)
-      skip_to(state, recovery_set)
+      do_skip_to(state, recovery_set)
     end
   end
 
   @doc """
   Skip tokens until we reach one in the recovery set (no error emission).
   Use when error was already emitted.
+  Increments recovery counter when actually skipping tokens.
   """
   def skip_to(state, recovery_set) do
     if State.at_any?(state, recovery_set) or State.at_end?(state) do
       state
     else
+      # We're about to skip - increment the recovery counter
+      state = State.increment_recovery_count(state)
+      do_skip_to(state, recovery_set)
+    end
+  end
+
+  defp do_skip_to(state, recovery_set) do
+    if State.at_any?(state, recovery_set) or State.at_end?(state) do
+      state
+    else
       {state, _token} = State.advance(state)
-      skip_to(state, recovery_set)
+      do_skip_to(state, recovery_set)
     end
   end
 end

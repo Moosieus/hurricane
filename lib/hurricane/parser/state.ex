@@ -39,7 +39,8 @@ defmodule Hurricane.Parser.State do
     :checkpoints,
     :errors,
     :ast,
-    :block_stack
+    :block_stack,
+    :recovery_counter
   ]
 
   @type t :: %__MODULE__{
@@ -48,7 +49,8 @@ defmodule Hurricane.Parser.State do
           checkpoints: [non_neg_integer()],
           errors: [{map(), String.t()}],
           ast: any(),
-          block_stack: [{pos_integer(), atom()}]
+          block_stack: [{pos_integer(), atom()}],
+          recovery_counter: :counters.counters_ref() | nil
         }
 
   @doc """
@@ -61,7 +63,8 @@ defmodule Hurricane.Parser.State do
       checkpoints: [],
       errors: [],
       ast: nil,
-      block_stack: []
+      block_stack: [],
+      recovery_counter: :counters.new(1, [:write_concurrency])
     }
   end
 
@@ -232,6 +235,7 @@ defmodule Hurricane.Parser.State do
 
   @doc """
   Add an error at the current position.
+  Also increments the recovery counter since encountering an error triggers recovery logic.
   """
   def add_error(state, message) do
     token = current(state)
@@ -243,11 +247,14 @@ defmodule Hurricane.Parser.State do
         %{line: 1, column: 1}
       end
 
+    # Increment recovery counter - any error on valid code indicates a parser issue
+    state = increment_recovery_count(state)
     %{state | errors: [{meta, message} | state.errors]}
   end
 
   @doc """
   Emit an error and consume the current token to make progress.
+  Note: add_error already increments the recovery counter.
   """
   def advance_with_error(state, message) do
     state = add_error(state, message)
@@ -260,6 +267,31 @@ defmodule Hurricane.Parser.State do
   """
   def errors(state) do
     Enum.reverse(state.errors)
+  end
+
+  ## RECOVERY COUNTER
+
+  @doc """
+  Increment the recovery counter.
+  Call this when the parser uses a recovery set to skip tokens.
+  """
+  def increment_recovery_count(state) do
+    if state.recovery_counter do
+      :counters.add(state.recovery_counter, 1, 1)
+    end
+
+    state
+  end
+
+  @doc """
+  Get the current recovery count.
+  """
+  def recovery_count(state) do
+    if state.recovery_counter do
+      :counters.get(state.recovery_counter, 1)
+    else
+      0
+    end
   end
 
   ## ADVANCE ASSERTIONS
